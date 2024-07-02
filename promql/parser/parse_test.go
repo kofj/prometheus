@@ -513,12 +513,12 @@ var testExpr = []struct {
 	{
 		input:  "2.5.",
 		fail:   true,
-		errMsg: "unexpected character: '.'",
+		errMsg: `1:1: parse error: bad number or duration syntax: "2.5."`,
 	},
 	{
 		input:  "100..4",
 		fail:   true,
-		errMsg: `unexpected number ".4"`,
+		errMsg: `1:1: parse error: bad number or duration syntax: "100.."`,
 	},
 	{
 		input:  "0deadbeef",
@@ -3696,9 +3696,17 @@ func makeInt64Pointer(val int64) *int64 {
 	return valp
 }
 
+func readable(s string) string {
+	const maxReadableStringLen = 40
+	if len(s) < maxReadableStringLen {
+		return s
+	}
+	return s[:maxReadableStringLen] + "..."
+}
+
 func TestParseExpressions(t *testing.T) {
 	for _, test := range testExpr {
-		t.Run(test.input, func(t *testing.T) {
+		t.Run(readable(test.input), func(t *testing.T) {
 			expr, err := ParseExpr(test.input)
 
 			// Unexpected errors are always caused by a bug.

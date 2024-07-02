@@ -16,7 +16,7 @@ Maintainers for specific parts of the codebase:
 * `model/histogram` and other code related to native histograms: Björn Rabenstein (<beorn@grafana.com> / @beorn7), 
 George Krajcsovits (<gyorgy.krajcsovits@grafana.com> / @krajorama)
 * `storage`
-  * `remote`: Callum Styan (<callumstyan@gmail.com> / @cstyan), Bartłomiej Płotka (<bwplotka@gmail.com> / @bwplotka), Tom Wilkie (<tom.wilkie@gmail.com> / @tomwilkie)
+  * `remote`: Callum Styan (<callumstyan@gmail.com> / @cstyan), Bartłomiej Płotka (<bwplotka@gmail.com> / @bwplotka), Tom Wilkie (tom.wilkie@gmail.com / @tomwilkie), Nicolás Pazos ( <npazosmendez@gmail.com> / @npazosmendez), Alex Greenbank ( <alex.greenbank@grafana.com> / @alexgreenbank)
     * `otlptranslator`: Arve Knudsen (<arve.knudsen@gmail.com> / @aknuds1), Jesús Vázquez (<jesus.vazquez@grafana.com> / @jesusvazquez)
 * `tsdb`: Ganesh Vernekar (<ganesh@grafana.com> / @codesome), Bartłomiej Płotka (<bwplotka@gmail.com> / @bwplotka), Jesús Vázquez (<jesus.vazquez@grafana.com> / @jesusvazquez)
   * `agent`: Robert Fratto (<robert.fratto@grafana.com> / @rfratto)
@@ -30,3 +30,13 @@ size of this repository, the natural changes in focus of maintainers over time,
 and nuances of where particular features live, this list will always be
 incomplete and out of date. However the listed maintainer(s) should be able to
 direct a PR/question to the right person.
+
+v3 release coordinators:
+* Alex Greenbank (<alex.greenbank@grafana.com> / @alexgreenbank)
+* Carrie Edwards (<carrie.edwards@grafana.com> / @carrieedwards)
+* Fiona Liao (<fiona.liao@grafana.com> / @fionaliao)
+* Jan Fajerski (<github@fajerski.name> / @jan--f)
+* Jesús Vázquez (<jesus.vazquez@grafana.com> / @jesusvazquez)
+* Nico Pazos (<nicolas.pazos-mendez@grafana.com> / @npazosmendez)
+* Owen Williams (<owen.williams@grafana.com> / @ywwg)
+* Tom Braack (<me@shorez.de> / @sh0rez)
