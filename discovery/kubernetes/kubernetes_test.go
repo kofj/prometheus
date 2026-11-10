@@ -1,4 +1,4 @@
-// Copyright 2018 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,19 +17,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
+	apiv1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/apimachinery/pkg/watch"
 	fakediscovery "k8s.io/client-go/discovery/fake"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
+	kubetesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
-
-	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -37,17 +43,25 @@ import (
 )
 
 func TestMain(m *testing.M) {
+	// Disable the WatchListClient feature gate that is enabled by default in
+	// client-go v0.35.0+. The WatchList flow requires the server to support
+	// SendInitialEvents and to send a bookmark event with the
+	// "k8s.io/initial-events-end" annotation. The fake clientset used in tests
+	// does not support this protocol, causing informers to hang indefinitely
+	// waiting for the bookmark. Disabling this feature restores the traditional
+	// List+Watch flow which is compatible with the fake clientset.
+	os.Setenv("KUBE_FEATURE_WatchListClient", "false")
 	testutil.TolerantVerifyLeak(m)
 }
 
 // makeDiscovery creates a kubernetes.Discovery instance for testing.
 func makeDiscovery(role Role, nsDiscovery NamespaceDiscovery, objects ...runtime.Object) (*Discovery, kubernetes.Interface) {
-	return makeDiscoveryWithVersion(role, nsDiscovery, "v1.22.0", objects...)
+	return makeDiscoveryWithVersion(role, nsDiscovery, "v1.25.0", objects...)
 }
 
 // makeDiscoveryWithVersion creates a kubernetes.Discovery instance with the specified kubernetes version for testing.
 func makeDiscoveryWithVersion(role Role, nsDiscovery NamespaceDiscovery, k8sVer string, objects ...runtime.Object) (*Discovery, kubernetes.Interface) {
-	clientset := fake.NewSimpleClientset(objects...)
+	clientset := fake.NewClientset(objects...)
 	fakeDiscovery, _ := clientset.Discovery().(*fakediscovery.FakeDiscovery)
 	fakeDiscovery.FakedServerVersion = &version.Info{GitVersion: k8sVer}
 
@@ -67,7 +81,7 @@ func makeDiscoveryWithVersion(role Role, nsDiscovery NamespaceDiscovery, k8sVer 
 
 	d := &Discovery{
 		client:             clientset,
-		logger:             log.NewNopLogger(),
+		logger:             promslog.NewNopLogger(),
 		role:               role,
 		namespaceDiscovery: &nsDiscovery,
 		ownNamespace:       "own-ns",
@@ -150,7 +164,7 @@ func (d k8sDiscoveryTest) Run(t *testing.T) {
 
 // readResultWithTimeout reads all targetgroups from channel with timeout.
 // It merges targetgroups by source and sends the result to result channel.
-func readResultWithTimeout(t *testing.T, ctx context.Context, ch <-chan []*targetgroup.Group, max int, stopAfter time.Duration, resChan chan<- map[string]*targetgroup.Group) {
+func readResultWithTimeout(t *testing.T, ctx context.Context, ch <-chan []*targetgroup.Group, maxGroups int, stopAfter time.Duration, resChan chan<- map[string]*targetgroup.Group) {
 	res := make(map[string]*targetgroup.Group)
 	timeout := time.After(stopAfter)
 Loop:
@@ -163,7 +177,7 @@ Loop:
 				}
 				res[tg.Source] = tg
 			}
-			if len(res) == max {
+			if len(res) == maxGroups {
 				// Reached max target groups we may get, break fast.
 				break Loop
 			}
@@ -171,10 +185,10 @@ Loop:
 			// Because we use queue, an object that is created then
 			// deleted or updated may be processed only once.
 			// So possibly we may skip events, timed out here.
-			t.Logf("timed out, got %d (max: %d) items, some events are skipped", len(res), max)
+			t.Logf("timed out, got %d (max: %d) items, some events are skipped", len(res), maxGroups)
 			break Loop
 		case <-ctx.Done():
-			t.Logf("stopped, got %d (max: %d) items", len(res), max)
+			t.Logf("stopped, got %d (max: %d) items", len(res), maxGroups)
 			break Loop
 		}
 	}
@@ -193,7 +207,7 @@ func requireTargetGroups(t *testing.T, expected, res map[string]*targetgroup.Gro
 		panic(err)
 	}
 
-	require.Equal(t, string(b1), string(b2))
+	require.JSONEq(t, string(b1), string(b2))
 }
 
 // marshalTargetGroups serializes a set of target groups to JSON, ignoring the
@@ -267,6 +281,7 @@ func (s *Service) hasSynced() bool {
 }
 
 func TestRetryOnError(t *testing.T) {
+	t.Parallel()
 	for _, successAt := range []int{1, 2, 3} {
 		var called int
 		f := func() error {
@@ -281,36 +296,54 @@ func TestRetryOnError(t *testing.T) {
 	}
 }
 
-func TestCheckNetworkingV1Supported(t *testing.T) {
+func TestFailuresCountMetric(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
-		version       string
-		wantSupported bool
-		wantErr       bool
+		role             Role
+		minFailedWatches int
 	}{
-		{version: "v1.18.0", wantSupported: false, wantErr: false},
-		{version: "v1.18.1", wantSupported: false, wantErr: false},
-		// networking v1 is supported since Kubernetes v1.19
-		{version: "v1.19.0", wantSupported: true, wantErr: false},
-		{version: "v1.20.0-beta.2", wantSupported: true, wantErr: false},
-		// error patterns
-		{version: "", wantSupported: false, wantErr: true},
-		{version: "<>", wantSupported: false, wantErr: true},
+		{RoleNode, 1},
+		{RolePod, 1},
+		{RoleService, 1},
+		{RoleEndpoint, 3},
+		{RoleEndpointSlice, 3},
+		{RoleIngress, 1},
 	}
 
 	for _, tc := range tests {
-		tc := tc
-		t.Run(tc.version, func(t *testing.T) {
-			clientset := fake.NewSimpleClientset()
-			fakeDiscovery, _ := clientset.Discovery().(*fakediscovery.FakeDiscovery)
-			fakeDiscovery.FakedServerVersion = &version.Info{GitVersion: tc.version}
-			supported, err := checkNetworkingV1Supported(clientset)
+		t.Run(string(tc.role), func(t *testing.T) {
+			t.Parallel()
 
-			if tc.wantErr {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-			}
-			require.Equal(t, tc.wantSupported, supported)
+			n, c := makeDiscovery(tc.role, NamespaceDiscovery{})
+			// The counter is initialized and no failures at the beginning.
+			require.Equal(t, float64(0), prom_testutil.ToFloat64(n.metrics.failuresCount))
+
+			// Simulate an error on watch requests.
+			c.Discovery().(*fakediscovery.FakeDiscovery).PrependWatchReactor("*", func(kubetesting.Action) (bool, watch.Interface, error) {
+				return true, nil, apierrors.NewUnauthorized("unauthorized")
+			})
+
+			// Start the discovery.
+			k8sDiscoveryTest{discovery: n}.Run(t)
+
+			// At least the errors of the initial watches should be caught (watches are retried on errors).
+			require.GreaterOrEqual(t, prom_testutil.ToFloat64(n.metrics.failuresCount), float64(tc.minFailedWatches))
 		})
 	}
+}
+
+func TestNodeName(t *testing.T) {
+	t.Parallel()
+	node := &apiv1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "foo",
+		},
+	}
+	name, err := nodeName(node)
+	require.NoError(t, err)
+	require.Equal(t, "foo", name)
+
+	name, err = nodeName(cache.DeletedFinalStateUnknown{Key: "bar"})
+	require.NoError(t, err)
+	require.Equal(t, "bar", name)
 }

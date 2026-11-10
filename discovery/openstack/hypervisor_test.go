@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -47,6 +47,7 @@ func (s *OpenstackSDHypervisorTestSuite) openstackAuthSuccess() (refresher, erro
 }
 
 func TestOpenstackSDHypervisorRefresh(t *testing.T) {
+	t.Parallel()
 	mock := &OpenstackSDHypervisorTestSuite{}
 	mock.SetupTest(t)
 
@@ -86,6 +87,7 @@ func TestOpenstackSDHypervisorRefresh(t *testing.T) {
 }
 
 func TestOpenstackSDHypervisorRefreshWithDoneContext(t *testing.T) {
+	t.Parallel()
 	mock := &OpenstackSDHypervisorTestSuite{}
 	mock.SetupTest(t)
 
@@ -93,6 +95,5 @@ func TestOpenstackSDHypervisorRefreshWithDoneContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := hypervisor.refresh(ctx)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), context.Canceled.Error(), "%q doesn't contain %q", err, context.Canceled)
+	require.ErrorContains(t, err, context.Canceled.Error(), "%q doesn't contain %q", err, context.Canceled)
 }

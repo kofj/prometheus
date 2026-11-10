@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,9 +14,9 @@
 package file
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -64,7 +64,7 @@ func newTestRunner(t *testing.T) *testRunner {
 	}
 }
 
-// copyFile atomically copies a file to the runner's directory.
+// copyFile copies a file to the runner's directory.
 func (t *testRunner) copyFile(src string) string {
 	t.Helper()
 	return t.copyFileTo(src, filepath.Base(src))
@@ -74,36 +74,50 @@ func (t *testRunner) copyFile(src string) string {
 func (t *testRunner) copyFileTo(src, name string) string {
 	t.Helper()
 
-	newf, err := os.CreateTemp(t.dir, "")
+	content, err := os.ReadFile(src)
 	require.NoError(t, err)
-
-	f, err := os.Open(src)
-	require.NoError(t, err)
-
-	_, err = io.Copy(newf, f)
-	require.NoError(t, err)
-	require.NoError(t, f.Close())
-	require.NoError(t, newf.Close())
 
 	dst := filepath.Join(t.dir, name)
-	err = os.Rename(newf.Name(), dst)
-	require.NoError(t, err)
+	t.atomicWrite(dst, content)
 
 	return dst
 }
 
-// writeString writes atomically a string to a file.
+// writeString atomically writes a string to a file.
 func (t *testRunner) writeString(file, data string) {
 	t.Helper()
+	t.atomicWrite(file, []byte(data))
+}
 
-	newf, err := os.CreateTemp(t.dir, "")
+// atomicWrite writes data to dst atomically by writing to a temporary file
+// and renaming it. The temp file is created outside the watched directory to
+// avoid triggering spurious fsnotify events that could cause readFile to hold
+// an open handle on dst (which would make os.Rename fail on Windows).
+func (t *testRunner) atomicWrite(dst string, data []byte) {
+	t.Helper()
+
+	// Create the temp file via t.TempDir() rather than in t.dir (the watched
+	// directory). t.TempDir() returns a fresh directory on the same filesystem
+	// as t.dir, so os.Rename works, and cleanup is handled by the test framework.
+	tmp, err := os.CreateTemp(t.TempDir(), ".sd-test-*")
 	require.NoError(t, err)
 
-	_, err = newf.WriteString(data)
+	_, err = tmp.Write(data)
 	require.NoError(t, err)
-	require.NoError(t, newf.Close())
+	require.NoError(t, tmp.Close())
 
-	err = os.Rename(newf.Name(), file)
+	// On Windows, os.Rename fails if another process holds an open handle
+	// on dst. This can happen if a previous refresh cycle's readFile call
+	// hasn't released the file yet. Retry a few times to handle this;
+	// on Linux/macOS os.Rename always succeeds regardless, so the retry
+	// never triggers.
+	for retries := 0; ; retries++ {
+		err = os.Rename(tmp.Name(), dst)
+		if err == nil || retries >= 5 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	require.NoError(t, err)
 }
 
@@ -203,31 +217,45 @@ func (t *testRunner) targets() []*targetgroup.Group {
 func (t *testRunner) requireUpdate(ref time.Time, expected []*targetgroup.Group) {
 	t.Helper()
 
+	want, err := json.Marshal(expected)
+	require.NoError(t, err)
+
 	timeout := time.After(defaultWait)
 	for {
 		select {
 		case <-timeout:
-			t.Fatalf("Expected update but got none")
+			t.Fatalf("Expected update but got none, last: %s", t.targetGroupsJSON(t.targets()))
 		case <-time.After(defaultWait / 10):
 			if ref.Equal(t.lastReceive()) {
 				// No update received.
 				break
 			}
 
-			// We can receive partial updates so only check the result when the
-			// expected number of groups is reached.
+			// File SD can emit an empty snapshot (matching group count) before
+			// the file contents are visible. Keep waiting until the groups
+			// match rather than failing on the first incomplete update.
 			tgs := t.targets()
-			if len(tgs) != len(expected) {
-				t.Logf("skipping update: expected %d targets, got %d", len(expected), len(tgs))
+			got, err := json.Marshal(tgs)
+			require.NoError(t, err)
+			if !bytes.Equal(want, got) {
+				t.Logf("skipping incomplete update: %s", got)
 				break
 			}
-			t.requireTargetGroups(expected, tgs)
 			if ref.After(time.Time{}) {
 				t.Logf("update received after %v", t.lastReceive().Sub(ref))
 			}
 			return
 		}
 	}
+}
+
+func (t *testRunner) targetGroupsJSON(tgs []*targetgroup.Group) string {
+	t.Helper()
+	b, err := json.Marshal(tgs)
+	if err != nil {
+		return err.Error()
+	}
+	return string(b)
 }
 
 func (t *testRunner) requireTargetGroups(expected, got []*targetgroup.Group) {
@@ -323,7 +351,6 @@ func TestInitialUpdate(t *testing.T) {
 		"fixtures/valid.yml",
 		"fixtures/valid.json",
 	} {
-		tc := tc
 		t.Run(tc, func(t *testing.T) {
 			t.Parallel()
 
@@ -344,7 +371,6 @@ func TestInvalidFile(t *testing.T) {
 		"fixtures/invalid_nil.yml",
 		"fixtures/invalid_nil.json",
 	} {
-		tc := tc
 		t.Run(tc, func(t *testing.T) {
 			t.Parallel()
 
@@ -490,4 +516,26 @@ func TestRemoveFile(t *testing.T) {
 			},
 		},
 	)
+}
+
+func TestFileUpdateBurst(t *testing.T) {
+	t.Parallel()
+
+	runner := newTestRunner(t)
+	sdFile := runner.copyFile("fixtures/valid.yml")
+
+	runner.run("*.yml")
+	defer runner.stop()
+
+	runner.requireUpdate(time.Time{}, validTg(sdFile))
+
+	// Generate more events than fsnotify's 50-event buffer in the watched
+	// directory while discovery is refreshing and re-adding directory watches.
+	ref := runner.lastReceive()
+	noiseFile := filepath.Join(runner.dir, "noise.txt")
+	for range 100 {
+		require.NoError(t, os.WriteFile(noiseFile, []byte("x"), 0o600))
+	}
+	runner.copyFileTo("fixtures/valid2.yml", "valid.yml")
+	runner.requireUpdate(ref, valid2Tg(sdFile))
 }

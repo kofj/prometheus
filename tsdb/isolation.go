@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -87,7 +87,7 @@ func newIsolation(disabled bool) *isolation {
 		appendsOpenList: appender,
 		readsOpen:       isoState,
 		disabled:        disabled,
-		appendersPool:   sync.Pool{New: func() interface{} { return &isolationAppender{} }},
+		appendersPool:   sync.Pool{New: func() any { return &isolationAppender{} }},
 	}
 }
 
@@ -216,6 +216,32 @@ func (i *isolation) lastAppendID() uint64 {
 	return i.appendsOpenList.appendID
 }
 
+// committedAppendID returns the highest appendID guaranteed to be committed
+// at the time of the call. Any sample with appendID <= committedAppendID()
+// has completed its commit path (its appender has called closeAppend), so it
+// cannot appear in isolationState.incompleteAppends.
+//
+// Returns 0 when isolation is disabled. If there are no open appenders, all
+// issued IDs are committed and the result is lastAppendID(). Otherwise, the
+// lowest open appendID is still in flight, and a block writer that snapshots
+// before it commits would exclude it. In that case, the highest guaranteed-
+// committed ID is one less than the lowest open appendID.
+func (i *isolation) committedAppendID() uint64 {
+	if i.disabled {
+		return 0
+	}
+
+	i.appendMtx.RLock()
+	defer i.appendMtx.RUnlock()
+
+	// appendsOpenList is a sentinel-headed ring; .next == sentinel means no open appenders,
+	// in which case the sentinel's appendID stores the last issued ID.
+	if i.appendsOpenList.next == i.appendsOpenList {
+		return i.appendsOpenList.appendID
+	}
+	return i.appendsOpenList.next.appendID - 1
+}
+
 func (i *isolation) closeAppend(appendID uint64) {
 	if i.disabled {
 		return
@@ -275,12 +301,11 @@ func (txr *txRing) cleanupAppendIDsBelow(bound uint64) {
 	pos := int(txr.txIDFirst)
 
 	for txr.txIDCount > 0 {
-		if txr.txIDs[pos] < bound {
-			txr.txIDFirst++
-			txr.txIDCount--
-		} else {
+		if txr.txIDs[pos] >= bound {
 			break
 		}
+		txr.txIDFirst++
+		txr.txIDCount--
 
 		pos++
 		if pos == len(txr.txIDs) {
@@ -296,6 +321,15 @@ func (txr *txRing) iterator() *txRingIterator {
 		pos: txr.txIDFirst,
 		ids: txr.txIDs,
 	}
+}
+
+// Returns the ID of the most recently added sample, if any.
+func (txr *txRing) lastAppendID() (uint64, bool) {
+	if txr == nil || txr.txIDCount == 0 || len(txr.txIDs) == 0 {
+		return 0, false
+	}
+	pos := (int(txr.txIDFirst) + int(txr.txIDCount) - 1) % len(txr.txIDs)
+	return txr.txIDs[pos], true
 }
 
 // txRingIterator lets you iterate over the ring. It doesn't terminate,

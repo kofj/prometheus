@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,8 +15,12 @@ package v1
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand"
 	"net"
@@ -30,18 +34,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/grafana/regexp"
 	jsoniter "github.com/json-iterator/go"
 	"github.com/munnerz/goautoneg"
+	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
+	"go.yaml.in/yaml/v2"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -52,7 +62,9 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/features"
 	"github.com/prometheus/prometheus/util/httputil"
+	"github.com/prometheus/prometheus/util/notifications"
 	"github.com/prometheus/prometheus/util/stats"
 )
 
@@ -65,21 +77,50 @@ const (
 	// Non-standard status code (originally introduced by nginx) for the case when a client closes
 	// the connection while the server is still processing the request.
 	statusClientClosedConnection = 499
+
+	// checkContextEveryNIterations is used in some tight loops to check if the context is done.
+	checkContextEveryNIterations = 128
 )
 
-type errorType string
+type errorNum int
+
+type errorType struct {
+	num errorNum
+	str string
+}
 
 const (
-	errorNone          errorType = ""
-	errorTimeout       errorType = "timeout"
-	errorCanceled      errorType = "canceled"
-	errorExec          errorType = "execution"
-	errorBadData       errorType = "bad_data"
-	errorInternal      errorType = "internal"
-	errorUnavailable   errorType = "unavailable"
-	errorNotFound      errorType = "not_found"
-	errorNotAcceptable errorType = "not_acceptable"
+	ErrorNone errorNum = iota
+	ErrorTimeout
+	ErrorCanceled
+	ErrorExec
+	ErrorBadData
+	ErrorInternal
+	ErrorUnavailable
+	ErrorNotFound
+	ErrorNotAcceptable
+	ErrorCostLimit
 )
+
+var (
+	errorNone          = errorType{ErrorNone, ""}
+	errorTimeout       = errorType{ErrorTimeout, "timeout"}
+	errorCanceled      = errorType{ErrorCanceled, "canceled"}
+	errorExec          = errorType{ErrorExec, "execution"}
+	errorBadData       = errorType{ErrorBadData, "bad_data"}
+	errorInternal      = errorType{ErrorInternal, "internal"}
+	errorUnavailable   = errorType{ErrorUnavailable, "unavailable"}
+	errorNotFound      = errorType{ErrorNotFound, "not_found"}
+	errorNotAcceptable = errorType{ErrorNotAcceptable, "not_acceptable"}
+	// errorCostLimit is returned when a query is rejected because it exceeds a
+	// configured query-cost limit on series or samples read. A query stopped by
+	// the duration limit is a timeout instead.
+	errorCostLimit = errorType{ErrorCostLimit, "cost_limit"}
+)
+
+// OverrideErrorCode can be used to override status code for different error types.
+// Return false to fall back to default status code.
+type OverrideErrorCode func(errorNum, error) (code int, override bool)
 
 var LocalhostRepresentations = []string{"127.0.0.1", "localhost", "::1"}
 
@@ -89,7 +130,7 @@ type apiError struct {
 }
 
 func (e *apiError) Error() string {
-	return fmt.Sprintf("%s: %s", e.typ, e.err)
+	return fmt.Sprintf("%s: %s", e.typ.str, e.err)
 }
 
 // ScrapePoolsRetriever provide the list of all scrape pools.
@@ -102,6 +143,7 @@ type TargetRetriever interface {
 	TargetsActive() map[string][]*scrape.Target
 	TargetsDropped() map[string][]*scrape.Target
 	TargetsDroppedCounts() map[string]int
+	ScrapePoolConfig(string) (*config.ScrapeConfig, error)
 }
 
 // AlertmanagerRetriever provides a list of all/dropped AlertManager URLs.
@@ -116,9 +158,16 @@ type RulesRetriever interface {
 	AlertingRules() []*rules.AlertingRule
 }
 
+// StatsRenderer converts engine statistics into a format suitable for the API.
 type StatsRenderer func(context.Context, *stats.Statistics, string) stats.QueryStats
 
-func defaultStatsRenderer(_ context.Context, s *stats.Statistics, param string) stats.QueryStats {
+// DefaultStatsRenderer is the default stats renderer for the API: any
+// non-empty `stats` value includes statistics in the response. The API
+// handlers attach a deprecation warning to the response for values outside
+// the supported enum ("true", "all"); those values will be rejected in the
+// next major release. Custom StatsRenderer implementations are exempt and
+// may define their own values.
+func DefaultStatsRenderer(_ context.Context, s *stats.Statistics, param string) stats.QueryStats {
 	if param != "" {
 		return stats.NewQueryStats(s)
 	}
@@ -139,6 +188,8 @@ type PrometheusVersion struct {
 type RuntimeInfo struct {
 	StartTime           time.Time `json:"startTime"`
 	CWD                 string    `json:"CWD"`
+	Hostname            string    `json:"hostname"`
+	ServerTime          time.Time `json:"serverTime"`
 	ReloadConfigSuccess bool      `json:"reloadConfigSuccess"`
 	LastConfigTime      time.Time `json:"lastConfigTime"`
 	CorruptionCount     int64     `json:"corruptionCount"`
@@ -152,15 +203,16 @@ type RuntimeInfo struct {
 
 // Response contains a response to a HTTP API request.
 type Response struct {
-	Status    status      `json:"status"`
-	Data      interface{} `json:"data,omitempty"`
-	ErrorType errorType   `json:"errorType,omitempty"`
-	Error     string      `json:"error,omitempty"`
-	Warnings  []string    `json:"warnings,omitempty"`
+	Status    status   `json:"status"`
+	Data      any      `json:"data,omitempty"`
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
+	Infos     []string `json:"infos,omitempty"`
 }
 
 type apiFuncResult struct {
-	data      interface{}
+	data      any
 	err       *apiError
 	warnings  annotations.Annotations
 	finalizer func()
@@ -175,11 +227,13 @@ type TSDBAdminStats interface {
 	Snapshot(dir string, withHead bool) error
 	Stats(statsByLabelName string, limit int) (*tsdb.Stats, error)
 	WALReplayStatus() (tsdb.WALReplayStatus, error)
+	BlockMetas() ([]tsdb.BlockMeta, error)
 }
 
 type QueryOpts interface {
 	EnablePerStepStats() bool
 	LookbackDelta() time.Duration
+	UseStartTimestamps() *bool
 }
 
 // API can register a set of endpoints in a router and handle
@@ -199,29 +253,62 @@ type API struct {
 	ready                 func(http.HandlerFunc) http.HandlerFunc
 	globalURLOptions      GlobalURLOptions
 
-	db            TSDBAdminStats
-	dbDir         string
-	enableAdmin   bool
-	logger        log.Logger
-	CORSOrigin    *regexp.Regexp
-	buildInfo     *PrometheusVersion
-	runtimeInfo   func() (RuntimeInfo, error)
-	gatherer      prometheus.Gatherer
-	isAgent       bool
-	statsRenderer StatsRenderer
+	db                  TSDBAdminStats
+	dbDir               string
+	enableAdmin         bool
+	enableSearch        bool
+	maxSearchLimit      int
+	metaCache           *searchMetadataCache
+	logger              *slog.Logger
+	CORSOrigin          *regexp.Regexp
+	buildInfo           *PrometheusVersion
+	runtimeInfo         func() (RuntimeInfo, error)
+	gatherer            prometheus.Gatherer
+	isAgent             bool
+	statsRenderer       StatsRenderer
+	customStatsRenderer bool // See validateStatsParam: a custom StatsRenderer's `stats` vocabulary is not validated.
+	notificationsGetter func() []notifications.Notification
+	notificationsSub    func() (<-chan notifications.Notification, func(), bool)
+	// Allows customizing the default mapping
+	overrideErrorCode OverrideErrorCode
 
 	remoteWriteHandler http.Handler
 	remoteReadHandler  http.Handler
 	otlpWriteHandler   http.Handler
 
 	codecs []Codec
+
+	featureRegistry features.Collector
+	openAPIBuilder  *OpenAPIBuilder
+
+	parser parser.Parser
+
+	// lookbackDelta is the engine's configured lookback delta, as set by
+	// --query.lookback-delta. It is the default the engine applies when a request
+	// does not override it with the lookback_delta parameter, and is handed to the
+	// cost estimator so the estimate models the same time windows the engine
+	// would read.
+	lookbackDelta time.Duration
+
+	// enableQueryCost reports whether the experimental query-cost feature is
+	// enabled. When set, it registers the query_cost and query_range_cost
+	// endpoints, makes extractQueryOpts honor the per-query cost-limit override
+	// parameters, and enables the estimated-vs-actual cost comparison on query
+	// and query_range. It has no effect when the feature is disabled.
+	enableQueryCost bool
+
+	// queryTimeoutFlag is the value of the --query.timeout flag. It is the
+	// effective query duration ceiling while the reloadable query_max_duration is
+	// unset, so the API resolves per-query duration overrides against the same
+	// ceiling the engine uses.
+	queryTimeoutFlag time.Duration
 }
 
 // NewAPI returns an initialized API type.
 func NewAPI(
 	qe promql.QueryEngine,
 	q storage.SampleAndChunkQueryable,
-	ap storage.Appendable,
+	apV2 storage.AppendableV2,
 	eq storage.ExemplarQueryable,
 	spsr func(context.Context) ScrapePoolsRetriever,
 	tr func(context.Context) TargetRetriever,
@@ -233,7 +320,9 @@ func NewAPI(
 	db TSDBAdminStats,
 	dbDir string,
 	enableAdmin bool,
-	logger log.Logger,
+	enableSearch bool,
+	maxSearchLimit int,
+	logger *slog.Logger,
 	rr func(context.Context) RulesRetriever,
 	remoteReadSampleLimit int,
 	remoteReadConcurrencyLimit int,
@@ -242,11 +331,23 @@ func NewAPI(
 	corsOrigin *regexp.Regexp,
 	runtimeInfo func() (RuntimeInfo, error),
 	buildInfo *PrometheusVersion,
+	notificationsGetter func() []notifications.Notification,
+	notificationsSub func() (<-chan notifications.Notification, func(), bool),
 	gatherer prometheus.Gatherer,
 	registerer prometheus.Registerer,
 	statsRenderer StatsRenderer,
 	rwEnabled bool,
-	otlpEnabled bool,
+	acceptRemoteWriteProtoMsgs remoteapi.MessageTypes,
+	otlpEnabled, otlpDeltaToCumulative, otlpNativeDeltaIngestion bool,
+	lookbackDelta time.Duration,
+	enableTypeAndUnitLabels bool,
+	appendMetadata bool,
+	overrideErrorCode OverrideErrorCode,
+	featureRegistry features.Collector,
+	openAPIOptions OpenAPIOptions,
+	promqlParser parser.Parser,
+	enableQueryCost bool,
+	queryTimeoutFlag time.Duration,
 ) *API {
 	a := &API{
 		QueryEngine:       qe,
@@ -257,41 +358,63 @@ func NewAPI(
 		targetRetriever:       tr,
 		alertmanagerRetriever: ar,
 
-		now:              time.Now,
-		config:           configFunc,
-		flagsMap:         flagsMap,
-		ready:            readyFunc,
-		globalURLOptions: globalURLOptions,
-		db:               db,
-		dbDir:            dbDir,
-		enableAdmin:      enableAdmin,
-		rulesRetriever:   rr,
-		logger:           logger,
-		CORSOrigin:       corsOrigin,
-		runtimeInfo:      runtimeInfo,
-		buildInfo:        buildInfo,
-		gatherer:         gatherer,
-		isAgent:          isAgent,
-		statsRenderer:    defaultStatsRenderer,
+		now:                 time.Now,
+		config:              configFunc,
+		flagsMap:            flagsMap,
+		ready:               readyFunc,
+		globalURLOptions:    globalURLOptions,
+		db:                  db,
+		dbDir:               dbDir,
+		enableAdmin:         enableAdmin,
+		enableSearch:        enableSearch,
+		maxSearchLimit:      maxSearchLimit,
+		metaCache:           &searchMetadataCache{},
+		rulesRetriever:      rr,
+		logger:              logger,
+		CORSOrigin:          corsOrigin,
+		runtimeInfo:         runtimeInfo,
+		buildInfo:           buildInfo,
+		gatherer:            gatherer,
+		isAgent:             isAgent,
+		statsRenderer:       DefaultStatsRenderer,
+		notificationsGetter: notificationsGetter,
+		notificationsSub:    notificationsSub,
+		overrideErrorCode:   overrideErrorCode,
+		featureRegistry:     featureRegistry,
+		openAPIBuilder:      NewOpenAPIBuilder(openAPIOptions, logger),
+		parser:              promqlParser,
+		lookbackDelta:       lookbackDelta,
+		enableQueryCost:     enableQueryCost,
+		queryTimeoutFlag:    queryTimeoutFlag,
 
 		remoteReadHandler: remote.NewReadHandler(logger, registerer, q, configFunc, remoteReadSampleLimit, remoteReadConcurrencyLimit, remoteReadMaxBytesInFrame),
+	}
+
+	if a.parser == nil {
+		a.parser = parser.NewParser(parser.Options{})
 	}
 
 	a.InstallCodec(JSONCodec{})
 
 	if statsRenderer != nil {
 		a.statsRenderer = statsRenderer
+		a.customStatsRenderer = true
 	}
 
-	if ap == nil && (rwEnabled || otlpEnabled) {
+	if apV2 == nil && (rwEnabled || otlpEnabled) {
 		panic("remote write or otlp write enabled, but no appender passed in.")
 	}
 
 	if rwEnabled {
-		a.remoteWriteHandler = remote.NewWriteHandler(logger, registerer, ap)
+		a.remoteWriteHandler = remote.NewWriteHandler(logger, registerer, apV2, acceptRemoteWriteProtoMsgs, enableTypeAndUnitLabels, appendMetadata)
 	}
 	if otlpEnabled {
-		a.otlpWriteHandler = remote.NewOTLPWriteHandler(logger, ap)
+		a.otlpWriteHandler = remote.NewOTLPWriteHandler(logger, registerer, apV2, configFunc, remote.OTLPOptions{
+			ConvertDelta:            otlpDeltaToCumulative,
+			NativeDelta:             otlpNativeDeltaIngestion,
+			LookbackDelta:           lookbackDelta,
+			EnableTypeAndUnitLabels: enableTypeAndUnitLabels,
+		})
 	}
 
 	return a
@@ -337,7 +460,7 @@ func (api *API) Register(r *route.Router) {
 			w.WriteHeader(http.StatusNoContent)
 		})
 		return api.ready(httputil.CompressionHandler{
-			Handler: hf,
+			Handler: api.openAPIBuilder.WrapHandler(hf),
 		}.ServeHTTP)
 	}
 
@@ -359,8 +482,21 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/query_exemplars", wrapAgent(api.queryExemplars))
 	r.Post("/query_exemplars", wrapAgent(api.queryExemplars))
 
+	// Cost estimation endpoints are only available when the query-cost feature
+	// is enabled. They require the TSDB index and are therefore unavailable in
+	// agent mode.
+	if api.enableQueryCost {
+		r.Get("/query_cost", wrapAgent(api.queryCost))
+		r.Post("/query_cost", wrapAgent(api.queryCost))
+		r.Get("/query_range_cost", wrapAgent(api.queryRangeCost))
+		r.Post("/query_range_cost", wrapAgent(api.queryRangeCost))
+	}
+
 	r.Get("/format_query", wrapAgent(api.formatQuery))
 	r.Post("/format_query", wrapAgent(api.formatQuery))
+
+	r.Get("/parse_query", wrapAgent(api.parseQuery))
+	r.Post("/parse_query", wrapAgent(api.parseQuery))
 
 	r.Get("/labels", wrapAgent(api.labelNames))
 	r.Post("/labels", wrapAgent(api.labelNames))
@@ -368,11 +504,12 @@ func (api *API) Register(r *route.Router) {
 
 	r.Get("/series", wrapAgent(api.series))
 	r.Post("/series", wrapAgent(api.series))
-	r.Del("/series", wrapAgent(api.dropSeries))
 
 	r.Get("/scrape_pools", wrap(api.scrapePools))
+	r.Get("/scrape_pools/config", wrap(api.scrapePoolConfig))
 	r.Get("/targets", wrap(api.targets))
 	r.Get("/targets/metadata", wrap(api.targetMetadata))
+	r.Get("/targets/relabel_steps", wrap(api.targetRelabelSteps))
 	r.Get("/alertmanagers", wrapAgent(api.alertmanagers))
 
 	r.Get("/metadata", wrap(api.metricMetadata))
@@ -382,10 +519,23 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/status/buildinfo", wrap(api.serveBuildInfo))
 	r.Get("/status/flags", wrap(api.serveFlags))
 	r.Get("/status/tsdb", wrapAgent(api.serveTSDBStatus))
+	r.Get("/status/tsdb/blocks", wrapAgent(api.serveTSDBBlocks))
+	r.Get("/status/self_metrics", wrap(api.selfMetrics))
+	r.Get("/features", wrap(api.features))
 	r.Get("/status/walreplay", api.serveWALReplayStatus)
+	r.Get("/notifications", api.notifications)
+	r.Get("/notifications/live", api.notificationsSSE)
 	r.Post("/read", api.ready(api.remoteRead))
 	r.Post("/write", api.ready(api.remoteWrite))
 	r.Post("/otlp/v1/metrics", api.ready(api.otlpWrite))
+
+	// Search endpoints.
+	r.Get("/search/metric_names", api.ready(api.searchMetricNames))
+	r.Post("/search/metric_names", api.ready(api.searchMetricNames))
+	r.Get("/search/label_names", api.ready(api.searchLabelNames))
+	r.Post("/search/label_names", api.ready(api.searchLabelNames))
+	r.Get("/search/label_values", api.ready(api.searchLabelValues))
+	r.Post("/search/label_values", api.ready(api.searchLabelValues))
 
 	r.Get("/alerts", wrapAgent(api.alerts))
 	r.Get("/rules", wrapAgent(api.rules))
@@ -398,12 +548,48 @@ func (api *API) Register(r *route.Router) {
 	r.Put("/admin/tsdb/delete_series", wrapAgent(api.deleteSeries))
 	r.Put("/admin/tsdb/clean_tombstones", wrapAgent(api.cleanTombstones))
 	r.Put("/admin/tsdb/snapshot", wrapAgent(api.snapshot))
+
+	// OpenAPI endpoint.
+	r.Get("/openapi.yaml", api.ready(api.openAPIBuilder.ServeOpenAPI))
 }
 
 type QueryData struct {
 	ResultType parser.ValueType `json:"resultType"`
 	Result     parser.Value     `json:"result"`
 	Stats      stats.QueryStats `json:"stats,omitempty"`
+	// Cost carries the estimated and actual cost of the query. It is populated
+	// only when the query-cost feature is enabled and the request opts in via
+	// the "cost" form parameter. It is additive and omitted otherwise.
+	Cost *QueryCostComparison `json:"cost,omitempty"`
+}
+
+// CostEstimate is the estimated or actual resource cost of a query. Estimated
+// values may be higher or lower than actual cost; see promql.CostEstimate.
+// Actual values are measured during execution in the engine's sample units.
+type CostEstimate struct {
+	// SeriesTouched is the number of series the query reads, summed per
+	// selector, including repeated reads of a series shared between selectors.
+	SeriesTouched int64 `json:"seriesTouched"`
+	// SamplesRead is storage input in the engine's sample units.
+	SamplesRead int64 `json:"samplesRead"`
+	// PeakSamples is the highest number of samples held in memory at once. It is
+	// only available for actual costs and is omitted when zero.
+	PeakSamples int64 `json:"peakSamples,omitempty"`
+}
+
+// QueryCostData is the payload returned by the query_cost and query_range_cost
+// endpoints. It carries the estimated cost of a query computed without executing
+// it.
+type QueryCostData struct {
+	Estimate CostEstimate `json:"estimate"`
+}
+
+// QueryCostComparison pairs the estimated storage input with the actual
+// cost measured during execution, allowing callers to gauge the accuracy of the
+// estimate.
+type QueryCostComparison struct {
+	Estimated CostEstimate `json:"estimated"`
+	Actual    CostEstimate `json:"actual"`
 }
 
 func invalidParamError(err error, parameter string) apiFuncResult {
@@ -412,34 +598,75 @@ func invalidParamError(err error, parameter string) apiFuncResult {
 	}, nil, nil}
 }
 
-func (api *API) options(*http.Request) apiFuncResult {
+func (*API) options(*http.Request) apiFuncResult {
 	return apiFuncResult{nil, nil, nil, nil}
 }
 
+func setQueryResultSpanAttributes(span trace.Span, qry promql.Query, value parser.Value) {
+	var resultSeries int
+	switch v := value.(type) {
+	case promql.Matrix:
+		resultSeries = v.Len()
+	case promql.Vector:
+		resultSeries = len(v)
+	}
+
+	var totalSamples int64
+	if s := qry.Stats(); s != nil && s.Samples != nil {
+		totalSamples = s.Samples.TotalSamples
+	}
+
+	span.SetAttributes(
+		attribute.Int("result_series", resultSeries),
+		attribute.Int64("total_samples", totalSamples),
+	)
+}
+
 func (api *API) query(r *http.Request) (result apiFuncResult) {
+	limit, err := parseLimitParam(r.FormValue("limit"))
+	if err != nil {
+		return invalidParamError(err, "limit")
+	}
 	ts, err := parseTimeParam(r, "time", api.now())
 	if err != nil {
 		return invalidParamError(err, "time")
 	}
 	ctx := r.Context()
-	if to := r.FormValue("timeout"); to != "" {
+	timeout, apiErr := api.queryTimeout(r)
+	if apiErr != nil {
+		return apiFuncResult{nil, apiErr, nil, nil}
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		timeout, err := parseDuration(to)
-		if err != nil {
-			return invalidParamError(err, "timeout")
-		}
-
 		ctx, cancel = context.WithDeadline(ctx, api.now().Add(timeout))
 		defer cancel()
 	}
 
-	opts, err := extractQueryOpts(r)
+	opts, err := api.extractQueryOpts(r)
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
+
+	costOn, err := api.costRequested(r)
+	if err != nil {
+		return invalidParamError(err, "cost")
+	}
+
+	ctx, span := otel.Tracer("").Start(ctx, "promqlInstantQuery")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("query", r.FormValue("query")),
+		attribute.String("timeout", r.FormValue("timeout")),
+		attribute.String("time", ts.Format(time.RFC3339Nano)),
+	)
+
+	// The query's duration limit starts while it is built.
+	limitStart := time.Now()
 	qry, err := api.QueryEngine.NewInstantQuery(ctx, api.Queryable, opts, r.FormValue("query"), ts)
 	if err != nil {
-		return invalidParamError(err, "query")
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return apiFuncResult{nil, queryConstructionError(err), nil, nil}
 	}
 
 	// From now on, we must only return with a finalizer in the result (to
@@ -451,29 +678,58 @@ func (api *API) query(r *http.Request) (result apiFuncResult) {
 		}
 	}()
 
+	// Estimate after building, so that the estimation counts against the
+	// query's duration limit, and before executing, so that no finished result
+	// is held in memory while the estimation waits for a query slot.
+	var pendingCost pendingCostComparison
+	if costOn {
+		pendingCost = api.estimateForComparison(ctx, limitStart, r.FormValue("query"), ts, ts, 0, opts)
+	}
+
 	ctx = httputil.ContextFromRequest(ctx, r)
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
+		span.RecordError(res.Err)
+		span.SetStatus(codes.Error, res.Err.Error())
 		return apiFuncResult{nil, returnAPIError(res.Err), res.Warnings, qry.Close}
 	}
+	setQueryResultSpanAttributes(span, qry, res.Value)
 
+	warnings := res.Warnings
+	if limit > 0 {
+		var isTruncated bool
+
+		res, isTruncated = truncateResults(res, limit)
+		if isTruncated {
+			warnings = warnings.Add(errors.New("results truncated due to limit"))
+		}
+	}
+	if warn := api.statsParamWarning(r.FormValue("stats")); warn != nil {
+		warnings = warnings.Add(warn)
+	}
 	// Optional stats field in response if parameter "stats" is not empty.
 	sr := api.statsRenderer
 	if sr == nil {
-		sr = defaultStatsRenderer
+		sr = DefaultStatsRenderer
 	}
 	qs := sr(ctx, qry.Stats(), r.FormValue("stats"))
+
+	var cost *QueryCostComparison
+	if costOn {
+		cost, warnings = pendingCost.finish(qry, warnings)
+	}
 
 	return apiFuncResult{&QueryData{
 		ResultType: res.Value.Type(),
 		Result:     res.Value,
 		Stats:      qs,
-	}, nil, res.Warnings, qry.Close}
+		Cost:       cost,
+	}, nil, warnings, qry.Close}
 }
 
 func (api *API) formatQuery(r *http.Request) (result apiFuncResult) {
-	expr, err := parser.ParseExpr(r.FormValue("query"))
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return invalidParamError(err, "query")
 	}
@@ -481,7 +737,16 @@ func (api *API) formatQuery(r *http.Request) (result apiFuncResult) {
 	return apiFuncResult{expr.Pretty(0), nil, nil, nil}
 }
 
-func extractQueryOpts(r *http.Request) (promql.QueryOpts, error) {
+func (api *API) parseQuery(r *http.Request) apiFuncResult {
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
+	if err != nil {
+		return invalidParamError(err, "query")
+	}
+
+	return apiFuncResult{data: translateAST(expr), err: nil, warnings: nil, finalizer: nil}
+}
+
+func (api *API) extractQueryOpts(r *http.Request) (promql.QueryOpts, error) {
 	var duration time.Duration
 
 	if strDuration := r.FormValue("lookback_delta"); strDuration != "" {
@@ -492,10 +757,325 @@ func extractQueryOpts(r *http.Request) (promql.QueryOpts, error) {
 		duration = parsedDuration
 	}
 
-	return promql.NewPrometheusQueryOpts(r.FormValue("stats") == "all", duration), nil
+	var useStartTimestamps *bool
+	if val := r.Header.Get("X-Prometheus-Use-Start-Timestamps"); val != "" {
+		b, err := strconv.ParseBool(val)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing X-Prometheus-Use-Start-Timestamps header: %w", err)
+		}
+		useStartTimestamps = &b
+	}
+
+	enablePerStepStats := r.FormValue("stats") == statsAll
+
+	// Per-query cost-limit overrides are only honored when the query-cost
+	// feature is enabled. They may only lower the operator-set ceiling.
+	if !api.enableQueryCost {
+		return promql.NewPrometheusQueryOpts(enablePerStepStats, duration, useStartTimestamps), nil
+	}
+
+	seriesCeiling, samplesCeiling, durationCeiling := api.queryCostCeilings()
+
+	var maxSeries, maxSamplesRead uint64
+	if v := r.FormValue("max_series"); v != "" {
+		parsed, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing max_series: %w", err)
+		}
+		maxSeries = parsed
+	}
+	if v := r.FormValue("max_samples_read"); v != "" {
+		parsed, err := strconv.ParseUint(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing max_samples_read: %w", err)
+		}
+		maxSamplesRead = parsed
+	}
+
+	var maxQueryDuration time.Duration
+	if v := r.FormValue("max_query_duration"); v != "" {
+		parsed, err := parseDuration(v)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing max_query_duration: %w", err)
+		}
+		if parsed < 0 {
+			return nil, fmt.Errorf("error parsing max_query_duration: must not be negative, got %s", parsed)
+		}
+		maxQueryDuration = parsed
+	}
+
+	// An override above the operator-set ceiling is rejected rather than clamped,
+	// so the caller learns that the limit it asked for was not applied. The engine
+	// applies the same rule when it builds a query and remains the authority for
+	// executed queries; checking here also covers the cost endpoints, which never
+	// build one.
+	if err := aboveCeiling("max_series", maxSeries, seriesCeiling); err != nil {
+		return nil, err
+	}
+	if err := aboveCeiling("max_samples_read", maxSamplesRead, samplesCeiling); err != nil {
+		return nil, err
+	}
+	if maxQueryDuration > 0 && durationCeiling > 0 && maxQueryDuration > durationCeiling {
+		return nil, promql.ErrLimitAboveCeiling{
+			Limit:     "max_query_duration",
+			Requested: maxQueryDuration.String(),
+			Ceiling:   durationCeiling.String(),
+		}
+	}
+
+	return promql.NewPrometheusQueryOptsWithLimits(enablePerStepStats, duration, maxSeries, maxSamplesRead, maxQueryDuration, useStartTimestamps), nil
 }
 
-func (api *API) queryRange(r *http.Request) (result apiFuncResult) {
+// aboveCeiling returns a promql.ErrLimitAboveCeiling when a per-query requested
+// limit exceeds the operator-set ceiling, and nil otherwise. Zero means
+// unlimited for both values, and a request equal to the ceiling is accepted.
+func aboveCeiling(name string, requested, ceiling uint64) error {
+	if requested == 0 || ceiling == 0 || requested <= ceiling {
+		return nil
+	}
+	return promql.ErrLimitAboveCeiling{
+		Limit:     name,
+		Requested: strconv.FormatUint(requested, 10),
+		Ceiling:   strconv.FormatUint(ceiling, 10),
+	}
+}
+
+// costRequested reports whether the request opted in to the actual-vs-estimated
+// cost comparison. It is honored only when the query-cost feature is enabled,
+// and is parsed as a boolean: an empty value leaves it disabled, and any other
+// value must parse via strconv.ParseBool.
+func (api *API) costRequested(r *http.Request) (bool, error) {
+	if !api.enableQueryCost {
+		return false, nil
+	}
+	v := r.FormValue("cost")
+	if v == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, errors.New("must be a boolean")
+	}
+	return b, nil
+}
+
+// scrapeInterval returns the global scrape interval from the current
+// configuration, used to estimate the number of samples per series. It falls
+// back to zero when no configuration is available, in which case the estimator
+// degrades to one sample per series.
+func (api *API) scrapeInterval() time.Duration {
+	if api.config == nil {
+		return 0
+	}
+	return time.Duration(api.config().GlobalConfig.ScrapeInterval)
+}
+
+// queryCostCeilings returns the operator-set, reloadable query-cost ceilings
+// from the global configuration. Zero means unlimited for each of them. They are
+// only meaningful when the query-cost feature is enabled, so all-zero is
+// returned when it is not.
+func (api *API) queryCostCeilings() (maxSeries, maxSamplesRead uint64, maxDuration time.Duration) {
+	if !api.enableQueryCost || api.config == nil {
+		return 0, 0, 0
+	}
+	g := api.config().GlobalConfig
+	maxDuration = time.Duration(g.QueryMaxDuration)
+	if maxDuration <= 0 {
+		// While query_max_duration is unset the --query.timeout flag is
+		// still the ceiling the engine enforces, so resolve against it here too.
+		maxDuration = api.queryTimeoutFlag
+	}
+	return g.QueryMaxSeries, g.QueryMaxSamplesRead, maxDuration
+}
+
+// subqueryDefaultStep returns the default evaluation interval the engine uses
+// for a subquery without an explicit step, read from the global
+// evaluation_interval configuration. It mirrors the engine's
+// NoStepSubqueryIntervalFn so the cost estimator models subqueries on the same
+// step grid the engine evaluates them on. It falls back to zero when no
+// configuration is available, in which case the estimator uses its own default.
+func (api *API) subqueryDefaultStep() time.Duration {
+	if api.config == nil {
+		return 0
+	}
+	return time.Duration(api.config().GlobalConfig.EvaluationInterval)
+}
+
+// effectiveLookbackDelta returns the lookback delta the engine would apply to
+// this query: the per-query lookback_delta override when set, and otherwise the
+// engine's configured default.
+func (api *API) effectiveLookbackDelta(opts promql.QueryOpts) time.Duration {
+	if opts != nil && opts.LookbackDelta() > 0 {
+		return opts.LookbackDelta()
+	}
+	return api.lookbackDelta
+}
+
+// queryTimeout parses the per-query "timeout" parameter, returning zero when it
+// is absent. Unlike the per-query cost overrides, a timeout above the effective
+// query duration ceiling is not an error: the shorter deadline of that ceiling
+// still applies. A non-positive timeout is rejected, since it could only ever
+// produce an already-expired deadline.
+func (*API) queryTimeout(r *http.Request) (time.Duration, *apiError) {
+	v := r.FormValue("timeout")
+	if v == "" {
+		return 0, nil
+	}
+	timeout, err := parseDuration(v)
+	if err != nil {
+		return 0, &apiError{errorBadData, fmt.Errorf("invalid parameter %q: %w", "timeout", err)}
+	}
+	if timeout <= 0 {
+		return 0, &apiError{errorBadData, fmt.Errorf("invalid parameter %q: timeout must be positive, got %s", "timeout", timeout)}
+	}
+	return timeout, nil
+}
+
+// queryConstructionError maps an error returned when building a query to an API
+// error. A per-query limit override above the operator-set ceiling is reported
+// as bad data with the engine's message, which names the limit, the requested
+// value and the ceiling. Running out of time or being canceled, for example
+// while waiting for a query slot, is reported as a timeout or a cancellation.
+// Any other failure is a bad query parameter.
+func queryConstructionError(err error) *apiError {
+	if _, ok := errors.AsType[promql.ErrLimitAboveCeiling](err); ok {
+		return &apiError{errorBadData, err}
+	}
+	if _, ok := errors.AsType[promql.ErrQueryTimeout](err); ok {
+		return returnAPIError(err)
+	}
+	if _, ok := errors.AsType[promql.ErrQueryCanceled](err); ok {
+		return returnAPIError(err)
+	}
+	return &apiError{errorBadData, fmt.Errorf("invalid parameter %q: %w", "query", err)}
+}
+
+// pendingCostComparison is the cost estimate of a query made before it runs,
+// waiting to be paired with the query's actual cost.
+type pendingCostComparison struct {
+	estimate promql.CostEstimate
+	annos    annotations.Annotations
+	err      error
+}
+
+// estimateForComparison estimates the cost of a built query over [start,end]
+// step before it runs, within the query's duration limit, which started at
+// limitStart. Estimating before execution means that no finished result is held
+// in memory while the estimation waits for a query slot. It is only called when
+// the query-cost feature is enabled and the request opted in.
+func (api *API) estimateForComparison(ctx context.Context, limitStart time.Time, qs string, start, end time.Time, step time.Duration, opts promql.QueryOpts) pendingCostComparison {
+	estimate, annos, err := api.estimateQueryCost(ctx, limitStart, qs, start, end, step, opts)
+	return pendingCostComparison{estimate: estimate, annos: annos, err: err}
+}
+
+// finish pairs the estimate with the actual cost read from the executed query's
+// statistics, merging the estimator's warnings into warnings. A failed estimate
+// never fails the query: it is reported as a warning, and no comparison is
+// returned.
+func (p pendingCostComparison) finish(qry promql.Query, warnings annotations.Annotations) (*QueryCostComparison, annotations.Annotations) {
+	warnings = warnings.Merge(p.annos)
+	if p.err != nil {
+		return nil, warnings.Add(fmt.Errorf("cost estimation failed: %w", p.err))
+	}
+
+	comparison := &QueryCostComparison{
+		Estimated: CostEstimate{
+			SeriesTouched: p.estimate.SeriesTouched,
+			SamplesRead:   p.estimate.SamplesRead,
+		},
+	}
+
+	if s := qry.Stats(); s != nil && s.Samples != nil {
+		comparison.Actual = CostEstimate{
+			SeriesTouched: s.Samples.TotalSeries,
+			SamplesRead:   s.Samples.SamplesRead,
+			PeakSamples:   int64(s.Samples.PeakSamples),
+		}
+	}
+
+	return comparison, warnings
+}
+
+// estimateQueryCost bounds every estimation, including estimates for cost
+// comparisons, by the engine's concurrency limit and by the effective duration
+// limit, counted from limitStart.
+func (api *API) estimateQueryCost(ctx context.Context, limitStart time.Time, qs string, start, end time.Time, step time.Duration, opts promql.QueryOpts) (promql.CostEstimate, annotations.Annotations, error) {
+	_, _, duration := api.queryCostCeilings()
+	if limits, ok := opts.(promql.QueryCostOpts); ok && limits.MaxQueryDuration() > 0 {
+		if duration <= 0 || limits.MaxQueryDuration() < duration {
+			duration = limits.MaxQueryDuration()
+		}
+	}
+	if duration > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, limitStart.Add(duration))
+		defer cancel()
+	}
+	if acquirer, ok := api.QueryEngine.(promql.QuerySlotAcquirer); ok {
+		release, err := acquirer.AcquireQuerySlot(ctx, qs)
+		defer release()
+		if err != nil {
+			return promql.CostEstimate{}, nil, err
+		}
+	}
+	return promql.EstimateCost(ctx, api.Queryable, api.parser, qs, start, end, step, api.effectiveLookbackDelta(opts), api.subqueryDefaultStep(), api.scrapeInterval())
+}
+
+// queryCost estimates the cost of an instant query without executing it. It
+// takes the same parameters as query but stops before evaluation and returns the
+// estimate. The parameters that only shape an executed query's response
+// ("limit", "stats" and "cost") are validated exactly as query validates them
+// and then ignored, so that a request accepted by one endpoint is accepted by
+// the other. It is only registered when the query-cost feature is enabled.
+func (api *API) queryCost(r *http.Request) apiFuncResult {
+	if _, err := parseLimitParam(r.FormValue("limit")); err != nil {
+		return invalidParamError(err, "limit")
+	}
+	if _, err := api.costRequested(r); err != nil {
+		return invalidParamError(err, "cost")
+	}
+	ts, err := parseTimeParam(r, "time", api.now())
+	if err != nil {
+		return invalidParamError(err, "time")
+	}
+
+	ctx := r.Context()
+	timeout, apiErr := api.queryTimeout(r)
+	if apiErr != nil {
+		return apiFuncResult{nil, apiErr, nil, nil}
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, api.now().Add(timeout))
+		defer cancel()
+	}
+
+	opts, err := api.extractQueryOpts(r)
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
+	res := api.estimateCostResult(ctx, r.FormValue("query"), ts, ts, 0, opts)
+	if warn := api.statsParamWarning(r.FormValue("stats")); warn != nil {
+		res.warnings = res.warnings.Add(warn)
+	}
+	return res
+}
+
+// queryRangeCost estimates the cost of a range query without executing it. It
+// takes the same parameters as queryRange but stops before evaluation and
+// returns the estimate. The parameters that only shape an executed query's
+// response ("limit", "stats" and "cost") are validated exactly as queryRange
+// validates them and then ignored, so that a request accepted by one endpoint is
+// accepted by the other. It is only registered when the query-cost feature is
+// enabled.
+func (api *API) queryRangeCost(r *http.Request) apiFuncResult {
+	if _, err := parseLimitParam(r.FormValue("limit")); err != nil {
+		return invalidParamError(err, "limit")
+	}
+	if _, err := api.costRequested(r); err != nil {
+		return invalidParamError(err, "cost")
+	}
 	start, err := parseTime(r.FormValue("start"))
 	if err != nil {
 		return invalidParamError(err, "start")
@@ -525,24 +1105,170 @@ func (api *API) queryRange(r *http.Request) (result apiFuncResult) {
 	}
 
 	ctx := r.Context()
-	if to := r.FormValue("timeout"); to != "" {
+	timeout, apiErr := api.queryTimeout(r)
+	if apiErr != nil {
+		return apiFuncResult{nil, apiErr, nil, nil}
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		timeout, err := parseDuration(to)
-		if err != nil {
-			return invalidParamError(err, "timeout")
-		}
-
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
 
-	opts, err := extractQueryOpts(r)
+	opts, err := api.extractQueryOpts(r)
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
-	qry, err := api.QueryEngine.NewRangeQuery(ctx, api.Queryable, opts, r.FormValue("query"), start, end, step)
+
+	res := api.estimateCostResult(ctx, r.FormValue("query"), start, end, step, opts)
+	if warn := api.statsParamWarning(r.FormValue("stats")); warn != nil {
+		res.warnings = res.warnings.Add(warn)
+	}
+	return res
+}
+
+// estimateCostResult runs the cost estimator over [start,end] step and maps the
+// result into a QueryCostData payload. The estimator is given the same lookback
+// delta and default subquery interval the engine would use for this query.
+//
+// Estimating touches storage, so it is bounded the same way an executed query
+// is: it holds one of the engine's concurrent query slots for its duration, and
+// it inherits the effective query duration ceiling as a deadline, honoring shorter
+// request overrides. Exceeding the deadline returns an error, not a partial estimate.
+//
+// A malformed query is reported as bad data, matching /query rather than looking
+// like an execution failure, and an exhausted deadline is reported as a timeout.
+// Other estimator warnings are propagated and errors are mapped via
+// returnAPIError.
+func (api *API) estimateCostResult(ctx context.Context, qs string, start, end time.Time, step time.Duration, opts promql.QueryOpts) apiFuncResult {
+	expr, err := api.parser.ParseExpr(qs)
 	if err != nil {
 		return invalidParamError(err, "query")
+	}
+	if step > 0 && expr.Type() != parser.ValueTypeVector && expr.Type() != parser.ValueTypeScalar {
+		return invalidParamError(fmt.Errorf("invalid expression type %q for range query, must be Scalar or instant Vector", parser.DocumentedType(expr.Type())), "query")
+	}
+	if _, err := promql.PreprocessExpr(expr, start, end, step); err != nil {
+		return invalidParamError(err, "query")
+	}
+
+	estimate, annos, err := api.estimateQueryCost(ctx, time.Now(), qs, start, end, step, opts)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return apiFuncResult{nil, &apiError{errorTimeout, fmt.Errorf("cost estimation exceeded the query duration limit: %w", err)}, annos, nil}
+		}
+		return apiFuncResult{nil, returnAPIError(err), annos, nil}
+	}
+
+	return apiFuncResult{&QueryCostData{
+		Estimate: CostEstimate{
+			SeriesTouched: estimate.SeriesTouched,
+			SamplesRead:   estimate.SamplesRead,
+		},
+	}, nil, annos, nil}
+}
+
+// Accepted values of the `stats` query parameter on /query and /query_range
+// when the default stats renderer is in use: statsTrue includes basic query
+// statistics in the response, statsAll additionally includes per-step
+// statistics (with --enable-feature=promql-per-step-stats). Empty disables
+// statistics.
+const (
+	statsTrue = "true"
+	statsAll  = "all"
+)
+
+// statsParamWarning returns a deprecation warning for unsupported values of
+// the `stats` query parameter, to be attached to the response's warnings.
+// Historically any non-empty value silently enabled basic statistics; that
+// behaviour is kept for compatibility within the current major release, but
+// values outside the supported enum ("true", "all") are deprecated and will
+// be rejected in the next major release. Embedders that install a custom
+// StatsRenderer define their own vocabulary for the parameter, so no warning
+// is attached then.
+func (api *API) statsParamWarning(s string) error {
+	if api.customStatsRenderer {
+		return nil
+	}
+	switch s {
+	case "", statsTrue, statsAll:
+		return nil
+	default:
+		return fmt.Errorf("value %q for parameter \"stats\" is deprecated and will be rejected in the next major release, use %q or %q", s, statsTrue, statsAll)
+	}
+}
+
+func (api *API) queryRange(r *http.Request) (result apiFuncResult) {
+	limit, err := parseLimitParam(r.FormValue("limit"))
+	if err != nil {
+		return invalidParamError(err, "limit")
+	}
+	start, err := parseTime(r.FormValue("start"))
+	if err != nil {
+		return invalidParamError(err, "start")
+	}
+	end, err := parseTime(r.FormValue("end"))
+	if err != nil {
+		return invalidParamError(err, "end")
+	}
+	if end.Before(start) {
+		return invalidParamError(errors.New("end timestamp must not be before start time"), "end")
+	}
+
+	step, err := parseDuration(r.FormValue("step"))
+	if err != nil {
+		return invalidParamError(err, "step")
+	}
+
+	if step <= 0 {
+		return invalidParamError(errors.New("zero or negative query resolution step widths are not accepted. Try a positive integer"), "step")
+	}
+
+	// For safety, limit the number of returned points per timeseries.
+	// This is sufficient for 60s resolution for a week or 1h resolution for a year.
+	if end.Sub(start)/step > 11000 {
+		err := errors.New("exceeded maximum resolution of 11,000 points per timeseries. Try decreasing the query resolution (?step=XX)")
+		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
+	ctx := r.Context()
+	timeout, apiErr := api.queryTimeout(r)
+	if apiErr != nil {
+		return apiFuncResult{nil, apiErr, nil, nil}
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	opts, err := api.extractQueryOpts(r)
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
+	costOn, err := api.costRequested(r)
+	if err != nil {
+		return invalidParamError(err, "cost")
+	}
+
+	ctx, span := otel.Tracer("").Start(ctx, "promqlRangeQuery")
+	defer span.End()
+	span.SetAttributes(
+		attribute.String("query", r.FormValue("query")),
+		attribute.String("timeout", r.FormValue("timeout")),
+		attribute.String("start", start.Format(time.RFC3339Nano)),
+		attribute.String("end", end.Format(time.RFC3339Nano)),
+		attribute.Stringer("step", step),
+	)
+
+	// The query's duration limit starts while it is built.
+	limitStart := time.Now()
+	qry, err := api.QueryEngine.NewRangeQuery(ctx, api.Queryable, opts, r.FormValue("query"), start, end, step)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, err.Error())
+		return apiFuncResult{nil, queryConstructionError(err), nil, nil}
 	}
 	// From now on, we must only return with a finalizer in the result (to
 	// be called by the caller) or call qry.Close ourselves (which is
@@ -553,25 +1279,55 @@ func (api *API) queryRange(r *http.Request) (result apiFuncResult) {
 		}
 	}()
 
+	// Estimate after building, so that the estimation counts against the
+	// query's duration limit, and before executing, so that no finished result
+	// is held in memory while the estimation waits for a query slot.
+	var pendingCost pendingCostComparison
+	if costOn {
+		pendingCost = api.estimateForComparison(ctx, limitStart, r.FormValue("query"), start, end, step, opts)
+	}
+
 	ctx = httputil.ContextFromRequest(ctx, r)
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
+		span.RecordError(res.Err)
+		span.SetStatus(codes.Error, res.Err.Error())
 		return apiFuncResult{nil, returnAPIError(res.Err), res.Warnings, qry.Close}
+	}
+	setQueryResultSpanAttributes(span, qry, res.Value)
+
+	warnings := res.Warnings
+	if limit > 0 {
+		var isTruncated bool
+
+		res, isTruncated = truncateResults(res, limit)
+		if isTruncated {
+			warnings = warnings.Add(errors.New("results truncated due to limit"))
+		}
+	}
+	if warn := api.statsParamWarning(r.FormValue("stats")); warn != nil {
+		warnings = warnings.Add(warn)
 	}
 
 	// Optional stats field in response if parameter "stats" is not empty.
 	sr := api.statsRenderer
 	if sr == nil {
-		sr = defaultStatsRenderer
+		sr = DefaultStatsRenderer
 	}
 	qs := sr(ctx, qry.Stats(), r.FormValue("stats"))
+
+	var cost *QueryCostComparison
+	if costOn {
+		cost, warnings = pendingCost.finish(qry, warnings)
+	}
 
 	return apiFuncResult{&QueryData{
 		ResultType: res.Value.Type(),
 		Result:     res.Value,
 		Stats:      qs,
-	}, nil, res.Warnings, qry.Close}
+		Cost:       cost,
+	}, nil, warnings, qry.Close}
 }
 
 func (api *API) queryExemplars(r *http.Request) apiFuncResult {
@@ -588,7 +1344,7 @@ func (api *API) queryExemplars(r *http.Request) apiFuncResult {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
 
-	expr, err := parser.ParseExpr(r.FormValue("query"))
+	expr, err := api.parser.ParseExpr(r.FormValue("query"))
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
 	}
@@ -620,11 +1376,17 @@ func returnAPIError(err error) *apiError {
 	var eqc promql.ErrQueryCanceled
 	var eqt promql.ErrQueryTimeout
 	var es promql.ErrStorage
+	var etms promql.ErrTooManySeries
+	var etmss promql.ErrTooManySamplesRead
 	switch {
 	case errors.As(err, &eqc):
 		return &apiError{errorCanceled, err}
 	case errors.As(err, &eqt):
 		return &apiError{errorTimeout, err}
+	case errors.As(err, &etms):
+		return &apiError{errorCostLimit, err}
+	case errors.As(err, &etmss):
+		return &apiError{errorCostLimit, err}
 	case errors.As(err, &es):
 		return &apiError{errorInternal, err}
 	}
@@ -651,9 +1413,13 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
+	hints := &storage.LabelHints{
+		Limit: toHintLimit(limit),
 	}
 
 	q, err := api.Queryable.Querier(timestamp.FromTime(start), timestamp.FromTime(end))
@@ -670,7 +1436,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		labelNamesSet := make(map[string]struct{})
 
 		for _, matchers := range matcherSets {
-			vals, callWarnings, err := q.LabelNames(r.Context(), matchers...)
+			vals, callWarnings, err := q.LabelNames(r.Context(), hints, matchers...)
 			if err != nil {
 				return apiFuncResult{nil, returnAPIError(err), warnings, nil}
 			}
@@ -692,7 +1458,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		if len(matcherSets) == 1 {
 			matchers = matcherSets[0]
 		}
-		names, warnings, err = q.LabelNames(r.Context(), matchers...)
+		names, warnings, err = q.LabelNames(r.Context(), hints, matchers...)
 		if err != nil {
 			return apiFuncResult{nil, &apiError{errorExec, err}, warnings, nil}
 		}
@@ -702,7 +1468,7 @@ func (api *API) labelNames(r *http.Request) apiFuncResult {
 		names = []string{}
 	}
 
-	if len(names) >= limit {
+	if limit > 0 && len(names) > limit {
 		names = names[:limit]
 		warnings = warnings.Add(errors.New("results truncated due to limit"))
 	}
@@ -713,7 +1479,11 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 	ctx := r.Context()
 	name := route.Param(ctx, "name")
 
-	if !model.LabelNameRE.MatchString(name) {
+	if strings.HasPrefix(name, "U__") {
+		name = model.UnescapeName(name, model.ValueEncodingEscaping)
+	}
+
+	if !model.UTF8Validation.IsValidLabelName(name) {
 		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("invalid label name: %q", name)}, nil, nil}
 	}
 
@@ -731,9 +1501,13 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
+	hints := &storage.LabelHints{
+		Limit: toHintLimit(limit),
 	}
 
 	q, err := api.Queryable.Querier(timestamp.FromTime(start), timestamp.FromTime(end))
@@ -760,7 +1534,7 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 		var callWarnings annotations.Annotations
 		labelValuesSet := make(map[string]struct{})
 		for _, matchers := range matcherSets {
-			vals, callWarnings, err = q.LabelValues(ctx, name, matchers...)
+			vals, callWarnings, err = q.LabelValues(ctx, name, hints, matchers...)
 			if err != nil {
 				return apiFuncResult{nil, &apiError{errorExec, err}, warnings, closer}
 			}
@@ -779,7 +1553,7 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 		if len(matcherSets) == 1 {
 			matchers = matcherSets[0]
 		}
-		vals, warnings, err = q.LabelValues(ctx, name, matchers...)
+		vals, warnings, err = q.LabelValues(ctx, name, hints, matchers...)
 		if err != nil {
 			return apiFuncResult{nil, &apiError{errorExec, err}, warnings, closer}
 		}
@@ -791,7 +1565,7 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 
 	slices.Sort(vals)
 
-	if len(vals) >= limit {
+	if limit > 0 && len(vals) > limit {
 		vals = vals[:limit]
 		warnings = warnings.Add(errors.New("results truncated due to limit"))
 	}
@@ -800,12 +1574,22 @@ func (api *API) labelValues(r *http.Request) (result apiFuncResult) {
 }
 
 var (
-	// MinTime is the default timestamp used for the begin of optional time ranges.
-	// Exposed to let downstream projects to reference it.
+	// MinTime is the default timestamp used for the start of optional time ranges.
+	// Exposed to let downstream projects reference it.
+	//
+	// Historical note: This should just be time.Unix(math.MinInt64/1000, 0).UTC(),
+	// but it was set to a higher value in the past due to a misunderstanding.
+	// The value is still low enough for practical purposes, so we don't want
+	// to change it now, avoiding confusion for importers of this variable.
 	MinTime = time.Unix(math.MinInt64/1000+62135596801, 0).UTC()
 
 	// MaxTime is the default timestamp used for the end of optional time ranges.
 	// Exposed to let downstream projects to reference it.
+	//
+	// Historical note: This should just be time.Unix(math.MaxInt64/1000, 0).UTC(),
+	// but it was set to a lower value in the past due to a misunderstanding.
+	// The value is still high enough for practical purposes, so we don't want
+	// to change it now, avoiding confusion for importers of this variable.
 	MaxTime = time.Unix(math.MaxInt64/1000-62135596801, 999999999).UTC()
 
 	minTimeFormatted = MinTime.Format(time.RFC3339Nano)
@@ -836,7 +1620,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 		return invalidParamError(err, "end")
 	}
 
-	matcherSets, err := parseMatchersParam(r.Form["match[]"])
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
 	if err != nil {
 		return invalidParamError(err, "match[]")
 	}
@@ -861,6 +1645,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 		Start: timestamp.FromTime(start),
 		End:   timestamp.FromTime(end),
 		Func:  "series", // There is no series function, this token is used for lookups that don't need samples.
+		Limit: toHintLimit(limit),
 	}
 	var set storage.SeriesSet
 
@@ -871,7 +1656,7 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 			s := q.Select(ctx, true, hints, mset...)
 			sets = append(sets, s)
 		}
-		set = storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
+		set = storage.NewMergeSeriesSet(sets, 0, storage.ChainedSeriesMerge)
 	} else {
 		// At this point at least one match exists.
 		set = q.Select(ctx, false, hints, matcherSets[0]...)
@@ -881,13 +1666,19 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 
 	warnings := set.Warnings()
 
+	i := 1
 	for set.Next() {
-		if err := ctx.Err(); err != nil {
-			return apiFuncResult{nil, returnAPIError(err), warnings, closer}
+		if i%checkContextEveryNIterations == 0 {
+			if err := ctx.Err(); err != nil {
+				return apiFuncResult{nil, returnAPIError(err), warnings, closer}
+			}
 		}
+		i++
+
 		metrics = append(metrics, set.At().Labels())
 
-		if len(metrics) >= limit {
+		if limit > 0 && len(metrics) > limit {
+			metrics = metrics[:limit]
 			warnings.Add(errors.New("results truncated due to limit"))
 			return apiFuncResult{metrics, nil, warnings, closer}
 		}
@@ -897,10 +1688,6 @@ func (api *API) series(r *http.Request) (result apiFuncResult) {
 	}
 
 	return apiFuncResult{metrics, nil, warnings, closer}
-}
-
-func (api *API) dropSeries(_ *http.Request) apiFuncResult {
-	return apiFuncResult{nil, &apiError{errorInternal, errors.New("not implemented")}, nil, nil}
 }
 
 // Target has the information for one target.
@@ -931,6 +1718,7 @@ type ScrapePoolsDiscovery struct {
 type DroppedTarget struct {
 	// Labels before any processing.
 	DiscoveredLabels labels.Labels `json:"discoveredLabels"`
+	ScrapePool       string        `json:"scrapePool"`
 }
 
 // TargetDiscovery has all the active targets.
@@ -1014,16 +1802,35 @@ func (api *API) scrapePools(r *http.Request) apiFuncResult {
 	return apiFuncResult{data: res, err: nil, warnings: nil, finalizer: nil}
 }
 
+func (api *API) scrapePoolConfig(r *http.Request) apiFuncResult {
+	scrapePool := r.FormValue("scrapePool")
+	if scrapePool == "" {
+		return apiFuncResult{nil, &apiError{errorBadData, errors.New("no scrapePool parameter provided")}, nil, nil}
+	}
+
+	scrapeConfig, err := api.targetRetriever(r.Context()).ScrapePoolConfig(scrapePool)
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("error retrieving scrape config: %w", err)}, nil, nil}
+	}
+
+	configYAML, err := yaml.Marshal(scrapeConfig)
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error marshaling scrape config: %w", err)}, nil, nil}
+	}
+
+	return apiFuncResult{&prometheusConfig{YAML: string(configYAML)}, nil, nil, nil}
+}
+
 func (api *API) targets(r *http.Request) apiFuncResult {
-	sortKeys := func(targets map[string][]*scrape.Target) ([]string, int) {
+	getSortedPools := func(targets map[string][]*scrape.Target) ([]string, int) {
 		var n int
-		keys := make([]string, 0, len(targets))
-		for k := range targets {
-			keys = append(keys, k)
-			n += len(targets[k])
+		pools := make([]string, 0, len(targets))
+		for p, t := range targets {
+			pools = append(pools, p)
+			n += len(t)
 		}
-		slices.Sort(keys)
-		return keys, n
+		slices.Sort(pools)
+		return pools, n
 	}
 
 	scrapePool := r.URL.Query().Get("scrapePool")
@@ -1031,18 +1838,18 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 	showActive := state == "" || state == "any" || state == "active"
 	showDropped := state == "" || state == "any" || state == "dropped"
 	res := &TargetDiscovery{}
+	builder := labels.NewBuilder(labels.EmptyLabels())
 
 	if showActive {
 		targetsActive := api.targetRetriever(r.Context()).TargetsActive()
-		activeKeys, numTargets := sortKeys(targetsActive)
+		activePools, numTargets := getSortedPools(targetsActive)
 		res.ActiveTargets = make([]*Target, 0, numTargets)
-		builder := labels.NewScratchBuilder(0)
 
-		for _, key := range activeKeys {
-			if scrapePool != "" && key != scrapePool {
+		for _, pool := range activePools {
+			if scrapePool != "" && pool != scrapePool {
 				continue
 			}
-			for _, target := range targetsActive[key] {
+			for _, target := range targetsActive[pool] {
 				lastErrStr := ""
 				lastErr := target.LastError()
 				if lastErr != nil {
@@ -1052,9 +1859,9 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 				globalURL, err := getGlobalURL(target.URL(), api.globalURLOptions)
 
 				res.ActiveTargets = append(res.ActiveTargets, &Target{
-					DiscoveredLabels: target.DiscoveredLabels(),
-					Labels:           target.Labels(&builder),
-					ScrapePool:       key,
+					DiscoveredLabels: target.DiscoveredLabels(builder),
+					Labels:           target.Labels(builder),
+					ScrapePool:       pool,
 					ScrapeURL:        target.URL().String(),
 					GlobalURL:        globalURL.String(),
 					LastError: func() string {
@@ -1080,18 +1887,18 @@ func (api *API) targets(r *http.Request) apiFuncResult {
 	}
 	if showDropped {
 		res.DroppedTargetCounts = api.targetRetriever(r.Context()).TargetsDroppedCounts()
-	}
-	if showDropped {
+
 		targetsDropped := api.targetRetriever(r.Context()).TargetsDropped()
-		droppedKeys, numTargets := sortKeys(targetsDropped)
+		droppedPools, numTargets := getSortedPools(targetsDropped)
 		res.DroppedTargets = make([]*DroppedTarget, 0, numTargets)
-		for _, key := range droppedKeys {
-			if scrapePool != "" && key != scrapePool {
+		for _, pool := range droppedPools {
+			if scrapePool != "" && pool != scrapePool {
 				continue
 			}
-			for _, target := range targetsDropped[key] {
+			for _, target := range targetsDropped[pool] {
 				res.DroppedTargets = append(res.DroppedTargets, &DroppedTarget{
-					DiscoveredLabels: target.DiscoveredLabels(),
+					DiscoveredLabels: target.DiscoveredLabels(builder),
+					ScrapePool:       pool,
 				})
 			}
 		}
@@ -1123,13 +1930,13 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 	var matchers []*labels.Matcher
 	var err error
 	if matchTarget != "" {
-		matchers, err = parser.ParseMetricSelector(matchTarget)
+		matchers, err = api.parser.ParseMetricSelector(matchTarget)
 		if err != nil {
 			return invalidParamError(err, "match_target")
 		}
 	}
 
-	builder := labels.NewScratchBuilder(0)
+	builder := labels.NewBuilder(labels.EmptyLabels())
 	metric := r.FormValue("metric")
 	res := []metricMetadata{}
 	for _, tt := range api.targetRetriever(r.Context()).TargetsActive() {
@@ -1137,7 +1944,7 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 			if limit >= 0 && len(res) >= limit {
 				break
 			}
-			targetLabels := t.Labels(&builder)
+			targetLabels := t.Labels(builder)
 			// Filter targets that don't satisfy the label matchers.
 			if matchTarget != "" && !matchLabels(targetLabels, matchers) {
 				continue
@@ -1146,11 +1953,11 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 			if metric == "" {
 				for _, md := range t.ListMetadata() {
 					res = append(res, metricMetadata{
-						Target: targetLabels,
-						Metric: md.Metric,
-						Type:   md.Type,
-						Help:   md.Help,
-						Unit:   md.Unit,
+						Target:       targetLabels,
+						MetricFamily: md.MetricFamily,
+						Type:         md.Type,
+						Help:         md.Help,
+						Unit:         md.Unit,
 					})
 				}
 				continue
@@ -1171,11 +1978,60 @@ func (api *API) targetMetadata(r *http.Request) apiFuncResult {
 }
 
 type metricMetadata struct {
-	Target labels.Labels    `json:"target"`
-	Metric string           `json:"metric,omitempty"`
-	Type   model.MetricType `json:"type"`
-	Help   string           `json:"help"`
-	Unit   string           `json:"unit"`
+	Target       labels.Labels    `json:"target"`
+	MetricFamily string           `json:"metric,omitempty"`
+	Type         model.MetricType `json:"type"`
+	Help         string           `json:"help"`
+	Unit         string           `json:"unit"`
+}
+
+type RelabelStep struct {
+	Rule   *relabel.Config `json:"rule"`
+	Output labels.Labels   `json:"output"`
+	Keep   bool            `json:"keep"`
+}
+
+type RelabelStepsResponse struct {
+	Steps []RelabelStep `json:"steps"`
+}
+
+func (api *API) targetRelabelSteps(r *http.Request) apiFuncResult {
+	scrapePool := r.FormValue("scrapePool")
+	if scrapePool == "" {
+		return apiFuncResult{nil, &apiError{errorBadData, errors.New("no scrapePool parameter provided")}, nil, nil}
+	}
+	labelsJSON := r.FormValue("labels")
+	if labelsJSON == "" {
+		return apiFuncResult{nil, &apiError{errorBadData, errors.New("no labels parameter provided")}, nil, nil}
+	}
+	var lbls labels.Labels
+	if err := json.Unmarshal([]byte(labelsJSON), &lbls); err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("error parsing labels: %w", err)}, nil, nil}
+	}
+
+	scrapeConfig, err := api.targetRetriever(r.Context()).ScrapePoolConfig(scrapePool)
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("error retrieving scrape config: %w", err)}, nil, nil}
+	}
+
+	rules := scrapeConfig.RelabelConfigs
+	steps := make([]RelabelStep, len(rules))
+	lb := labels.NewBuilder(lbls)
+	keep := true
+	for i, rule := range rules {
+		if keep {
+			keep = relabel.ProcessBuilder(lb, rule)
+		}
+
+		outLabels := labels.EmptyLabels()
+		if keep {
+			outLabels = lb.Labels()
+		}
+
+		steps[i] = RelabelStep{Rule: rule, Output: outLabels, Keep: keep}
+	}
+
+	return apiFuncResult{&RelabelStepsResponse{Steps: steps}, nil, nil, nil}
 }
 
 // AlertmanagerDiscovery has all the active Alertmanagers.
@@ -1275,7 +2131,7 @@ func (api *API) metricMetadata(r *http.Request) apiFuncResult {
 			if metric == "" {
 				for _, mm := range t.ListMetadata() {
 					m := metadata.Metadata{Type: mm.Type, Help: mm.Help, Unit: mm.Unit}
-					ms, ok := metrics[mm.Metric]
+					ms, ok := metrics[mm.MetricFamily]
 
 					if limitPerMetric > 0 && len(ms) >= limitPerMetric {
 						continue
@@ -1283,7 +2139,7 @@ func (api *API) metricMetadata(r *http.Request) apiFuncResult {
 
 					if !ok {
 						ms = map[metadata.Metadata]struct{}{}
-						metrics[mm.Metric] = ms
+						metrics[mm.MetricFamily] = ms
 					}
 					ms[m] = struct{}{}
 				}
@@ -1292,7 +2148,7 @@ func (api *API) metricMetadata(r *http.Request) apiFuncResult {
 
 			if md, ok := t.GetMetadata(metric); ok {
 				m := metadata.Metadata{Type: md.Type, Help: md.Help, Unit: md.Unit}
-				ms, ok := metrics[md.Metric]
+				ms, ok := metrics[md.MetricFamily]
 
 				if limitPerMetric > 0 && len(ms) >= limitPerMetric {
 					continue
@@ -1300,7 +2156,7 @@ func (api *API) metricMetadata(r *http.Request) apiFuncResult {
 
 				if !ok {
 					ms = map[metadata.Metadata]struct{}{}
-					metrics[md.Metric] = ms
+					metrics[md.MetricFamily] = ms
 				}
 				ms[m] = struct{}{}
 			}
@@ -1326,7 +2182,8 @@ func (api *API) metricMetadata(r *http.Request) apiFuncResult {
 
 // RuleDiscovery has info for all rules.
 type RuleDiscovery struct {
-	RuleGroups []*RuleGroup `json:"groups"`
+	RuleGroups     []*RuleGroup `json:"groups"`
+	GroupNextToken string       `json:"groupNextToken,omitempty"`
 }
 
 // RuleGroup has info for rules which are part of a group.
@@ -1343,7 +2200,7 @@ type RuleGroup struct {
 	LastEvaluation time.Time `json:"lastEvaluation"`
 }
 
-type Rule interface{}
+type Rule any
 
 type AlertingRule struct {
 	// State can be "pending", "firing", "inactive".
@@ -1366,7 +2223,7 @@ type AlertingRule struct {
 type RecordingRule struct {
 	Name           string           `json:"name"`
 	Query          string           `json:"query"`
-	Labels         labels.Labels    `json:"labels,omitempty"`
+	Labels         labels.Labels    `json:"labels"`
 	Health         rules.RuleHealth `json:"health"`
 	LastError      string           `json:"lastError,omitempty"`
 	EvaluationTime float64          `json:"evaluationTime"`
@@ -1392,6 +2249,11 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 	rgSet := queryFormToSet(r.Form["rule_group[]"])
 	fSet := queryFormToSet(r.Form["file[]"])
 
+	matcherSets, err := api.parseMatchersParam(r.Form["match[]"])
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorBadData, err}, nil, nil}
+	}
+
 	ruleGroups := api.rulesRetriever(r.Context()).RuleGroups()
 	res := &RuleDiscovery{RuleGroups: make([]*RuleGroup, 0, len(ruleGroups))}
 	typ := strings.ToLower(r.URL.Query().Get("type"))
@@ -1408,8 +2270,23 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 		return invalidParamError(err, "exclude_alerts")
 	}
 
+	maxGroups, nextToken, parseErr := parseListRulesPaginationRequest(r)
+	if parseErr != nil {
+		return *parseErr
+	}
+
 	rgs := make([]*RuleGroup, 0, len(ruleGroups))
+
+	foundToken := false
+
 	for _, grp := range ruleGroups {
+		if maxGroups > 0 && nextToken != "" && !foundToken {
+			if nextToken != getRuleGroupNextToken(grp.File(), grp.Name()) {
+				continue
+			}
+			foundToken = true
+		}
+
 		if len(rgSet) > 0 {
 			if _, ok := rgSet[grp.Name()]; !ok {
 				continue
@@ -1431,7 +2308,8 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 			EvaluationTime: grp.GetEvaluationTime().Seconds(),
 			LastEvaluation: grp.GetLastEvaluation(),
 		}
-		for _, rr := range grp.Rules() {
+
+		for _, rr := range grp.Rules(matcherSets...) {
 			var enrichedRule Rule
 
 			if len(rnSet) > 0 {
@@ -1453,6 +2331,7 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 				if !excludeAlerts {
 					activeAlerts = rulesAlertsToAPIAlerts(rule.ActiveAlerts())
 				}
+
 				enrichedRule = AlertingRule{
 					State:          rule.State().String(),
 					Name:           rule.Name(),
@@ -1468,6 +2347,7 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 					LastEvaluation: rule.GetEvaluationTimestamp(),
 					Type:           "alerting",
 				}
+
 			case *rules.RecordingRule:
 				if !returnRecording {
 					break
@@ -1494,9 +2374,20 @@ func (api *API) rules(r *http.Request) apiFuncResult {
 
 		// If the rule group response has no rules, skip it - this means we filtered all the rules of this group.
 		if len(apiRuleGroup.Rules) > 0 {
+			if maxGroups > 0 && len(rgs) == int(maxGroups) {
+				// We've reached the capacity of our page plus one. That means that for sure there will be at least one
+				// rule group in a subsequent request. Therefore a next token is required.
+				res.GroupNextToken = getRuleGroupNextToken(grp.File(), grp.Name())
+				break
+			}
 			rgs = append(rgs, apiRuleGroup)
 		}
 	}
+
+	if maxGroups > 0 && nextToken != "" && !foundToken {
+		return invalidParamError(fmt.Errorf("invalid group_next_token '%v'. were rule groups changed?", nextToken), "group_next_token")
+	}
+
 	res.RuleGroups = rgs
 	return apiFuncResult{res, nil, nil, nil}
 }
@@ -1515,11 +2406,49 @@ func parseExcludeAlerts(r *http.Request) (bool, error) {
 	return excludeAlerts, nil
 }
 
+func parseListRulesPaginationRequest(r *http.Request) (int64, string, *apiFuncResult) {
+	var (
+		parsedMaxGroups int64 = -1
+		err             error
+	)
+	maxGroups := r.URL.Query().Get("group_limit")
+	nextToken := r.URL.Query().Get("group_next_token")
+
+	if nextToken != "" && maxGroups == "" {
+		errResult := invalidParamError(errors.New("group_limit needs to be present in order to paginate over the groups"), "group_next_token")
+		return -1, "", &errResult
+	}
+
+	if maxGroups != "" {
+		parsedMaxGroups, err = strconv.ParseInt(maxGroups, 10, 32)
+		if err != nil {
+			errResult := invalidParamError(fmt.Errorf("group_limit needs to be a valid number: %w", err), "group_limit")
+			return -1, "", &errResult
+		}
+		if parsedMaxGroups <= 0 {
+			errResult := invalidParamError(errors.New("group_limit needs to be greater than 0"), "group_limit")
+			return -1, "", &errResult
+		}
+	}
+
+	if parsedMaxGroups > 0 {
+		return parsedMaxGroups, nextToken, nil
+	}
+
+	return -1, "", nil
+}
+
+func getRuleGroupNextToken(file, group string) string {
+	h := sha256.New()
+	h.Write([]byte(file + ";" + group))
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 type prometheusConfig struct {
 	YAML string `json:"yaml"`
 }
 
-func (api *API) serveRuntimeInfo(_ *http.Request) apiFuncResult {
+func (api *API) serveRuntimeInfo(*http.Request) apiFuncResult {
 	status, err := api.runtimeInfo()
 	if err != nil {
 		return apiFuncResult{status, &apiError{errorInternal, err}, nil, nil}
@@ -1527,19 +2456,42 @@ func (api *API) serveRuntimeInfo(_ *http.Request) apiFuncResult {
 	return apiFuncResult{status, nil, nil, nil}
 }
 
-func (api *API) serveBuildInfo(_ *http.Request) apiFuncResult {
+func (api *API) serveBuildInfo(*http.Request) apiFuncResult {
 	return apiFuncResult{api.buildInfo, nil, nil, nil}
 }
 
-func (api *API) serveConfig(_ *http.Request) apiFuncResult {
+func (api *API) serveConfig(*http.Request) apiFuncResult {
 	cfg := &prometheusConfig{
 		YAML: api.config().String(),
 	}
 	return apiFuncResult{cfg, nil, nil, nil}
 }
 
-func (api *API) serveFlags(_ *http.Request) apiFuncResult {
+func (api *API) serveFlags(*http.Request) apiFuncResult {
 	return apiFuncResult{api.flagsMap, nil, nil, nil}
+}
+
+// featuresData wraps feature flags data to provide custom JSON marshaling without HTML escaping.
+// featuresData does not contain user-provided input, and it is more convenient to have unescaped
+// representation of PromQL operators like >=.
+type featuresData struct {
+	data map[string]map[string]bool
+}
+
+func (f featuresData) MarshalJSON() ([]byte, error) {
+	json := jsoniter.Config{
+		EscapeHTML:             false,
+		SortMapKeys:            true,
+		ValidateJsonRawMessage: true,
+	}.Froze()
+	return json.Marshal(f.data)
+}
+
+func (api *API) features(*http.Request) apiFuncResult {
+	if api.featureRegistry == nil {
+		return apiFuncResult{nil, &apiError{errorInternal, errors.New("feature registry not configured")}, nil, nil}
+	}
+	return apiFuncResult{featuresData{data: api.featureRegistry.Get()}, nil, nil, nil}
 }
 
 // TSDBStat holds the information about individual cardinality.
@@ -1576,12 +2528,61 @@ func TSDBStatsFromIndexStats(stats []index.Stat) []TSDBStat {
 	return result
 }
 
+func (api *API) selfMetrics(r *http.Request) apiFuncResult {
+	var nameFilter *regexp.Regexp
+	if pattern := r.FormValue("metric_name_pattern"); pattern != "" {
+		var err error
+		nameFilter, err = regexp.Compile("^(?:" + pattern + ")$")
+		if err != nil {
+			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("invalid metric_name_pattern: %w", err)}, nil, nil}
+		}
+	}
+
+	mfs, err := api.gatherer.Gather()
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error gathering self metrics: %w", err)}, nil, nil}
+	}
+
+	marshaler := protojson.MarshalOptions{}
+	result := make([]json.RawMessage, 0, len(mfs))
+	for _, mf := range mfs {
+		if nameFilter != nil && !nameFilter.MatchString(mf.GetName()) {
+			continue
+		}
+
+		b, err := marshaler.Marshal(mf)
+		if err != nil {
+			return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error marshaling metric family %q: %w", mf.GetName(), err)}, nil, nil}
+		}
+		result = append(result, json.RawMessage(b))
+	}
+
+	return apiFuncResult{result, nil, nil, nil}
+}
+
+func (api *API) serveTSDBBlocks(*http.Request) apiFuncResult {
+	blockMetas, err := api.db.BlockMetas()
+	if err != nil {
+		return apiFuncResult{nil, &apiError{errorInternal, fmt.Errorf("error getting block metadata: %w", err)}, nil, nil}
+	}
+
+	return apiFuncResult{
+		data: map[string][]tsdb.BlockMeta{
+			"blocks": blockMetas,
+		},
+	}
+}
+
 func (api *API) serveTSDBStatus(r *http.Request) apiFuncResult {
+	const maxTSDBLimit = 10000
 	limit := 10
 	if s := r.FormValue("limit"); s != "" {
 		var err error
 		if limit, err = strconv.Atoi(s); err != nil || limit < 1 {
 			return apiFuncResult{nil, &apiError{errorBadData, errors.New("limit must be a positive number")}, nil, nil}
+		}
+		if limit > maxTSDBLimit {
+			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("limit must not exceed %d", maxTSDBLimit)}, nil, nil}
 		}
 	}
 	s, err := api.db.Stats(labels.MetricName, limit)
@@ -1628,12 +2629,64 @@ func (api *API) serveWALReplayStatus(w http.ResponseWriter, r *http.Request) {
 	status, err := api.db.WALReplayStatus()
 	if err != nil {
 		api.respondError(w, &apiError{errorInternal, err}, nil)
+		return
 	}
 	api.respond(w, r, walReplayStatus{
 		Min:     status.Min,
 		Max:     status.Max,
 		Current: status.Current,
 	}, nil, "")
+}
+
+func (api *API) notifications(w http.ResponseWriter, r *http.Request) {
+	httputil.SetCORS(w, api.CORSOrigin, r)
+	api.respond(w, r, api.notificationsGetter(), nil, "")
+}
+
+func (api *API) notificationsSSE(w http.ResponseWriter, r *http.Request) {
+	httputil.SetCORS(w, api.CORSOrigin, r)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Subscribe to notifications.
+	notifications, unsubscribe, ok := api.notificationsSub()
+	if !ok {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	defer unsubscribe()
+
+	// Set up a flusher to push the response to the client.
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	// Flush the response to ensure the headers are immediately and eventSource
+	// onopen is triggered client-side.
+	flusher.Flush()
+
+	for {
+		select {
+		case notification := <-notifications:
+			// Marshal the notification to JSON.
+			jsonData, err := json.Marshal(notification)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				continue
+			}
+
+			// Write the event data in SSE format with JSON content.
+			fmt.Fprintf(w, "data: %s\n\n", jsonData)
+
+			// Flush the response to ensure the data is sent immediately.
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
 }
 
 func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
@@ -1657,7 +2710,7 @@ func (api *API) otlpWrite(w http.ResponseWriter, r *http.Request) {
 	if api.otlpWriteHandler != nil {
 		api.otlpWriteHandler.ServeHTTP(w, r)
 	} else {
-		http.Error(w, "otlp write receiver needs to be enabled with --enable-feature=otlp-write-receiver", http.StatusNotFound)
+		http.Error(w, "otlp write receiver needs to be enabled with --web.enable-otlp-receiver", http.StatusNotFound)
 	}
 }
 
@@ -1682,7 +2735,7 @@ func (api *API) deleteSeries(r *http.Request) apiFuncResult {
 	}
 
 	for _, s := range r.Form["match[]"] {
-		matchers, err := parser.ParseMetricSelector(s)
+		matchers, err := api.parser.ParseMetricSelector(s)
 		if err != nil {
 			return invalidParamError(err, "match[]")
 		}
@@ -1741,13 +2794,15 @@ func (api *API) cleanTombstones(*http.Request) apiFuncResult {
 
 // Query string is needed to get the position information for the annotations, and it
 // can be empty if the position information isn't needed.
-func (api *API) respond(w http.ResponseWriter, req *http.Request, data interface{}, warnings annotations.Annotations, query string) {
+func (api *API) respond(w http.ResponseWriter, req *http.Request, data any, warnings annotations.Annotations, query string) {
 	statusMessage := statusSuccess
+	warn, info := warnings.AsStrings(query, 10, 10)
 
 	resp := &Response{
 		Status:   statusMessage,
 		Data:     data,
-		Warnings: warnings.AsStrings(query, 10),
+		Warnings: warn,
+		Infos:    info,
 	}
 
 	codec, err := api.negotiateCodec(req, resp)
@@ -1758,7 +2813,7 @@ func (api *API) respond(w http.ResponseWriter, req *http.Request, data interface
 
 	b, err := codec.Encode(resp)
 	if err != nil {
-		level.Error(api.logger).Log("msg", "error marshaling response", "err", err)
+		api.logger.Error("error marshaling response", "url", req.URL, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1766,7 +2821,7 @@ func (api *API) respond(w http.ResponseWriter, req *http.Request, data interface
 	w.Header().Set("Content-Type", codec.ContentType().String())
 	w.WriteHeader(http.StatusOK)
 	if n, err := w.Write(b); err != nil {
-		level.Error(api.logger).Log("msg", "error writing response", "bytesWritten", n, "err", err)
+		api.logger.Error("error writing response", "url", req.URL, "bytesWritten", n, "err", err)
 	}
 }
 
@@ -1787,44 +2842,58 @@ func (api *API) negotiateCodec(req *http.Request, resp *Response) (Codec, error)
 	return defaultCodec, nil
 }
 
-func (api *API) respondError(w http.ResponseWriter, apiErr *apiError, data interface{}) {
+func (api *API) respondError(w http.ResponseWriter, apiErr *apiError, data any) {
 	json := jsoniter.ConfigCompatibleWithStandardLibrary
 	b, err := json.Marshal(&Response{
 		Status:    statusError,
-		ErrorType: apiErr.typ,
+		ErrorType: apiErr.typ.str,
 		Error:     apiErr.err.Error(),
 		Data:      data,
 	})
 	if err != nil {
-		level.Error(api.logger).Log("msg", "error marshaling json response", "err", err)
+		api.logger.Error("error marshaling json response", "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
 	var code int
-	switch apiErr.typ {
-	case errorBadData:
-		code = http.StatusBadRequest
-	case errorExec:
-		code = http.StatusUnprocessableEntity
-	case errorCanceled:
-		code = statusClientClosedConnection
-	case errorTimeout:
-		code = http.StatusServiceUnavailable
-	case errorInternal:
-		code = http.StatusInternalServerError
-	case errorNotFound:
-		code = http.StatusNotFound
-	case errorNotAcceptable:
-		code = http.StatusNotAcceptable
-	default:
-		code = http.StatusInternalServerError
+	if api.overrideErrorCode != nil {
+		if newCode, override := api.overrideErrorCode(apiErr.typ.num, apiErr.err); override {
+			code = newCode
+		} else {
+			code = getDefaultErrorCode(apiErr.typ)
+		}
+	} else {
+		code = getDefaultErrorCode(apiErr.typ)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	if n, err := w.Write(b); err != nil {
-		level.Error(api.logger).Log("msg", "error writing response", "bytesWritten", n, "err", err)
+		api.logger.Error("error writing response", "bytesWritten", n, "err", err)
+	}
+}
+
+func getDefaultErrorCode(errType errorType) int {
+	switch errType {
+	case errorBadData:
+		return http.StatusBadRequest
+	case errorExec:
+		return http.StatusUnprocessableEntity
+	case errorCostLimit:
+		return http.StatusUnprocessableEntity
+	case errorCanceled:
+		return statusClientClosedConnection
+	case errorTimeout:
+		return http.StatusServiceUnavailable
+	case errorInternal:
+		return http.StatusInternalServerError
+	case errorNotFound:
+		return http.StatusNotFound
+	case errorNotAcceptable:
+		return http.StatusNotAcceptable
+	default:
+		return http.StatusInternalServerError
 	}
 }
 
@@ -1835,7 +2904,7 @@ func parseTimeParam(r *http.Request, paramName string, defaultValue time.Time) (
 	}
 	result, err := parseTime(val)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("Invalid time value for '%s': %w", paramName, err)
+		return time.Time{}, fmt.Errorf("invalid time value for '%s': %w", paramName, err)
 	}
 	return result, nil
 }
@@ -1866,7 +2935,8 @@ func parseTime(s string) (time.Time, error) {
 func parseDuration(s string) (time.Duration, error) {
 	if d, err := strconv.ParseFloat(s, 64); err == nil {
 		ts := d * float64(time.Second)
-		if ts > float64(math.MaxInt64) || ts < float64(math.MinInt64) {
+		// float64(math.MaxInt64) is 2^63, which int64 cannot hold, and NaN passes every comparison.
+		if math.IsNaN(ts) || ts >= float64(math.MaxInt64) || ts < float64(math.MinInt64) {
 			return 0, fmt.Errorf("cannot parse %q to a valid duration. It overflows int64", s)
 		}
 		return time.Duration(ts), nil
@@ -1877,8 +2947,8 @@ func parseDuration(s string) (time.Duration, error) {
 	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
 }
 
-func parseMatchersParam(matchers []string) ([][]*labels.Matcher, error) {
-	matcherSets, err := parser.ParseMetricSelectors(matchers)
+func (api *API) parseMatchersParam(matchers []string) ([][]*labels.Matcher, error) {
+	matcherSets, err := api.parser.ParseMetricSelectors(matchers)
 	if err != nil {
 		return nil, err
 	}
@@ -1895,8 +2965,8 @@ OUTER:
 	return matcherSets, nil
 }
 
+// parseLimitParam returning 0 means no limit is to be applied.
 func parseLimitParam(limitStr string) (limit int, err error) {
-	limit = math.MaxInt
 	if limitStr == "" {
 		return limit, nil
 	}
@@ -1905,9 +2975,41 @@ func parseLimitParam(limitStr string) (limit int, err error) {
 	if err != nil {
 		return limit, err
 	}
-	if limit <= 0 {
-		return limit, errors.New("limit must be positive")
+	if limit < 0 {
+		return limit, errors.New("limit must be non-negative")
 	}
 
 	return limit, nil
+}
+
+// toHintLimit increases the API limit, as returned by parseLimitParam, by 1.
+// This allows for emitting warnings when the results are truncated.
+func toHintLimit(limit int) int {
+	// 0 means no limit and avoid int overflow
+	if limit > 0 && limit < math.MaxInt {
+		return limit + 1
+	}
+	return limit
+}
+
+// truncateResults truncates result for queryRange() and query().
+// No truncation for other types(Scalars or Strings).
+func truncateResults(result *promql.Result, limit int) (*promql.Result, bool) {
+	isTruncated := false
+
+	switch v := result.Value.(type) {
+	case promql.Matrix:
+		if len(v) > limit {
+			result.Value = v[:limit]
+			isTruncated = true
+		}
+	case promql.Vector:
+		if len(v) > limit {
+			result.Value = v[:limit]
+			isTruncated = true
+		}
+	}
+
+	// Return the modified result. Unchanged for other types.
+	return result, isTruncated
 }

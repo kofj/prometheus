@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,18 +16,20 @@ package refresh
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	"github.com/prometheus/common/promslog"
+	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 )
 
 type Options struct {
-	Logger              log.Logger
+	Logger              *slog.Logger
 	Mech                string
+	SetName             string
 	Interval            time.Duration
 	RefreshF            func(ctx context.Context) ([]*targetgroup.Group, error)
 	MetricsInstantiator discovery.RefreshMetricsInstantiator
@@ -35,19 +37,19 @@ type Options struct {
 
 // Discovery implements the Discoverer interface.
 type Discovery struct {
-	logger   log.Logger
+	logger   *slog.Logger
 	interval time.Duration
 	refreshf func(ctx context.Context) ([]*targetgroup.Group, error)
-	metrics  *discovery.RefreshMetrics
+	mech     string
+	rmi      discovery.RefreshMetricsInstantiator
+	metrics  atomic.Pointer[discovery.RefreshMetrics]
 }
 
 // NewDiscovery returns a Discoverer function that calls a refresh() function at every interval.
 func NewDiscovery(opts Options) *Discovery {
-	m := opts.MetricsInstantiator.Instantiate(opts.Mech)
-
-	var logger log.Logger
+	var logger *slog.Logger
 	if opts.Logger == nil {
-		logger = log.NewNopLogger()
+		logger = promslog.NewNopLogger()
 	} else {
 		logger = opts.Logger
 	}
@@ -56,10 +58,17 @@ func NewDiscovery(opts Options) *Discovery {
 		logger:   logger,
 		interval: opts.Interval,
 		refreshf: opts.RefreshF,
-		metrics:  m,
+		mech:     opts.Mech,
+		rmi:      opts.MetricsInstantiator,
 	}
+	d.UpdateSetName(opts.SetName)
 
 	return &d
+}
+
+// UpdateSetName labels the refresh metrics with a new config name, without restarting the discoverer.
+func (d *Discovery) UpdateSetName(setName string) {
+	d.metrics.Store(d.rmi.Instantiate(d.mech, setName))
 }
 
 // Run implements the Discoverer interface.
@@ -68,7 +77,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 	tgs, err := d.refresh(ctx)
 	if err != nil {
 		if !errors.Is(ctx.Err(), context.Canceled) {
-			level.Error(d.logger).Log("msg", "Unable to refresh target groups", "err", err.Error())
+			d.logger.Error("Unable to refresh target groups", "err", err.Error())
 		}
 	} else {
 		select {
@@ -87,7 +96,7 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 			tgs, err := d.refresh(ctx)
 			if err != nil {
 				if !errors.Is(ctx.Err(), context.Canceled) {
-					level.Error(d.logger).Log("msg", "Unable to refresh target groups", "err", err.Error())
+					d.logger.Error("Unable to refresh target groups", "err", err.Error())
 				}
 				continue
 			}
@@ -105,13 +114,15 @@ func (d *Discovery) Run(ctx context.Context, ch chan<- []*targetgroup.Group) {
 
 func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	now := time.Now()
+	metrics := d.metrics.Load()
 	defer func() {
-		d.metrics.Duration.Observe(time.Since(now).Seconds())
+		metrics.Duration.Observe(time.Since(now).Seconds())
+		metrics.DurationHistogram.Observe(time.Since(now).Seconds())
 	}()
 
 	tgs, err := d.refreshf(ctx)
 	if err != nil {
-		d.metrics.Failures.Inc()
+		metrics.Failures.Inc()
 	}
 	return tgs, err
 }

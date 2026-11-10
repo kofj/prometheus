@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"slices"
 	"sort"
-	"strings"
 	"sync"
 
 	"github.com/gogo/protobuf/proto"
@@ -30,10 +29,10 @@ import (
 	"github.com/prometheus/common/model"
 	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 
-	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -68,6 +67,14 @@ func DecodeReadRequest(r *http.Request) (*prompb.ReadRequest, error) {
 		return nil, err
 	}
 
+	decodedLen, err := snappy.DecodedLen(compressed)
+	if err != nil {
+		return nil, err
+	}
+	if decodedLen > decodeReadLimit {
+		return nil, fmt.Errorf("snappy: decoded length %d exceeds limit %d", decodedLen, decodeReadLimit)
+	}
+
 	reqBuf, err := snappy.Decode(nil, compressed)
 	if err != nil {
 		return nil, err
@@ -95,7 +102,7 @@ func EncodeReadResponse(resp *prompb.ReadResponse, w http.ResponseWriter) error 
 
 // ToQuery builds a Query proto.
 func ToQuery(from, to int64, matchers []*labels.Matcher, hints *storage.SelectHints) (*prompb.Query, error) {
-	ms, err := toLabelMatchers(matchers)
+	ms, err := ToLabelMatchers(matchers)
 	if err != nil {
 		return nil, err
 	}
@@ -153,10 +160,10 @@ func ToQueryResult(ss storage.SeriesSet, sampleLimit int) (*prompb.QueryResult, 
 				})
 			case chunkenc.ValHistogram:
 				ts, h := iter.AtHistogram(nil)
-				histograms = append(histograms, HistogramToHistogramProto(ts, h))
+				histograms = append(histograms, prompb.FromIntHistogram(ts, h))
 			case chunkenc.ValFloatHistogram:
 				ts, fh := iter.AtFloatHistogram(nil)
-				histograms = append(histograms, FloatHistogramToHistogramProto(ts, fh))
+				histograms = append(histograms, prompb.FromFloatHistogram(ts, fh))
 			default:
 				return nil, ss.Warnings(), fmt.Errorf("unrecognized value type: %s", valType)
 			}
@@ -166,7 +173,7 @@ func ToQueryResult(ss storage.SeriesSet, sampleLimit int) (*prompb.QueryResult, 
 		}
 
 		resp.Timeseries = append(resp.Timeseries, &prompb.TimeSeries{
-			Labels:     labelsToLabelsProto(series.Labels(), nil),
+			Labels:     prompb.FromLabels(series.Labels(), nil),
 			Samples:    samples,
 			Histograms: histograms,
 		})
@@ -182,7 +189,7 @@ func FromQueryResult(sortSeries bool, res *prompb.QueryResult) storage.SeriesSet
 		if err := validateLabelsAndMetricName(ts.Labels); err != nil {
 			return errSeriesSet{err: err}
 		}
-		lbls := labelProtosToLabels(&b, ts.Labels)
+		lbls := ts.ToLabels(&b, nil)
 		series = append(series, &concreteSeries{labels: lbls, floats: ts.Samples, histograms: ts.Histograms})
 	}
 
@@ -235,7 +242,7 @@ func StreamChunkedReadResponses(
 	for ss.Next() {
 		series := ss.At()
 		iter = series.Iterator(iter)
-		lbls = MergeLabels(labelsToLabelsProto(series.Labels(), lbls), sortedExternalLabels)
+		lbls = MergeLabels(prompb.FromLabels(series.Labels(), lbls), sortedExternalLabels)
 
 		maxDataLength := maxBytesInFrame
 		for _, lbl := range lbls {
@@ -284,7 +291,7 @@ func StreamChunkedReadResponses(
 				return ss.Warnings(), fmt.Errorf("write to stream: %w", err)
 			}
 
-			// We immediately flush the Write() so it is safe to return to the pool.
+			// The Write() has consumed b, so it is safe to return to the pool.
 			marshalPool.Put(&b)
 			chks = chks[:0]
 			frameBytesLeft = maxDataLength
@@ -341,7 +348,7 @@ func (e errSeriesSet) Err() error {
 	return e.err
 }
 
-func (e errSeriesSet) Warnings() annotations.Annotations { return nil }
+func (errSeriesSet) Warnings() annotations.Annotations { return nil }
 
 // concreteSeriesSet implements storage.SeriesSet.
 type concreteSeriesSet struct {
@@ -358,11 +365,11 @@ func (c *concreteSeriesSet) At() storage.Series {
 	return c.series[c.cur-1]
 }
 
-func (c *concreteSeriesSet) Err() error {
+func (*concreteSeriesSet) Err() error {
 	return nil
 }
 
-func (c *concreteSeriesSet) Warnings() annotations.Annotations { return nil }
+func (*concreteSeriesSet) Warnings() annotations.Annotations { return nil }
 
 // concreteSeries implements storage.Series.
 type concreteSeries struct {
@@ -389,6 +396,12 @@ type concreteSeriesIterator struct {
 	histogramsCur int
 	curValType    chunkenc.ValueType
 	series        *concreteSeries
+	err           error
+
+	// These are pre-filled with the current model histogram if curValType
+	// is ValHistogram or ValFloatHistogram, respectively.
+	curH  *histogram.Histogram
+	curFH *histogram.FloatHistogram
 }
 
 func newConcreteSeriesIterator(series *concreteSeries) chunkenc.Iterator {
@@ -405,10 +418,14 @@ func (c *concreteSeriesIterator) reset(series *concreteSeries) {
 	c.histogramsCur = -1
 	c.curValType = chunkenc.ValNone
 	c.series = series
+	c.err = nil
 }
 
 // Seek implements storage.SeriesIterator.
 func (c *concreteSeriesIterator) Seek(t int64) chunkenc.ValueType {
+	if c.err != nil {
+		return chunkenc.ValNone
+	}
 	if c.floatsCur == -1 {
 		c.floatsCur = 0
 	}
@@ -440,7 +457,7 @@ func (c *concreteSeriesIterator) Seek(t int64) chunkenc.ValueType {
 		if c.series.floats[c.floatsCur].Timestamp <= c.series.histograms[c.histogramsCur].Timestamp {
 			c.curValType = chunkenc.ValFloat
 		} else {
-			c.curValType = getHistogramValType(&c.series.histograms[c.histogramsCur])
+			c.curValType = chunkenc.ValHistogram
 		}
 		// When the timestamps do not overlap the cursor for the non-selected sample type has advanced too
 		// far; we decrement it back down here.
@@ -454,16 +471,68 @@ func (c *concreteSeriesIterator) Seek(t int64) chunkenc.ValueType {
 	case c.floatsCur < len(c.series.floats):
 		c.curValType = chunkenc.ValFloat
 	case c.histogramsCur < len(c.series.histograms):
-		c.curValType = getHistogramValType(&c.series.histograms[c.histogramsCur])
+		c.curValType = chunkenc.ValHistogram
+	}
+	if c.curValType == chunkenc.ValHistogram {
+		c.setCurrentHistogram()
+	}
+	if c.err != nil {
+		c.curValType = chunkenc.ValNone
 	}
 	return c.curValType
 }
 
-func getHistogramValType(h *prompb.Histogram) chunkenc.ValueType {
-	if h.IsFloatHistogram() {
-		return chunkenc.ValFloatHistogram
+// setCurrentHistogram pre-fills either the curH or the curFH field with a
+// converted model histogram and sets c.curValType accordingly. It validates the
+// histogram and sets c.err accordingly. This all has to be done in Seek() and
+// Next() already so that we know if the histogram we got from the remote-read
+// source is valid or not before we allow the AtHistogram()/AtFloatHistogram()
+// call.
+func (c *concreteSeriesIterator) setCurrentHistogram() {
+	pbH := c.series.histograms[c.histogramsCur]
+
+	// Basic schema check first.
+	schema := pbH.Schema
+	if !histogram.IsKnownSchema(schema) {
+		c.err = histogram.UnknownSchemaError(schema)
+		return
 	}
-	return chunkenc.ValHistogram
+
+	if pbH.IsFloatHistogram() {
+		c.curValType = chunkenc.ValFloatHistogram
+		mFH := pbH.ToFloatHistogram()
+		if mFH.Schema > histogram.ExponentialSchemaMax && mFH.Schema <= histogram.ExponentialSchemaMaxReserved {
+			// This is a very slow path, but it should only happen if the
+			// sample is from a newer Prometheus version that supports higher
+			// resolution.
+			if err := mFH.ReduceResolution(histogram.ExponentialSchemaMax); err != nil {
+				c.err = err
+				return
+			}
+		}
+		if err := mFH.Validate(); err != nil {
+			c.err = err
+			return
+		}
+		c.curFH = mFH
+		return
+	}
+	c.curValType = chunkenc.ValHistogram
+	mH := pbH.ToIntHistogram()
+	if mH.Schema > histogram.ExponentialSchemaMax && mH.Schema <= histogram.ExponentialSchemaMaxReserved {
+		// This is a very slow path, but it should only happen if the
+		// sample is from a newer Prometheus version that supports higher
+		// resolution.
+		if err := mH.ReduceResolution(histogram.ExponentialSchemaMax); err != nil {
+			c.err = err
+			return
+		}
+	}
+	if err := mH.Validate(); err != nil {
+		c.err = err
+		return
+	}
+	c.curH = mH
 }
 
 // At implements chunkenc.Iterator.
@@ -480,19 +549,16 @@ func (c *concreteSeriesIterator) AtHistogram(*histogram.Histogram) (int64, *hist
 	if c.curValType != chunkenc.ValHistogram {
 		panic("iterator is not on an integer histogram sample")
 	}
-	h := c.series.histograms[c.histogramsCur]
-	return h.Timestamp, HistogramProtoToHistogram(h)
+	return c.series.histograms[c.histogramsCur].Timestamp, c.curH
 }
 
 // AtFloatHistogram implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
 	switch c.curValType {
-	case chunkenc.ValHistogram:
-		fh := c.series.histograms[c.histogramsCur]
-		return fh.Timestamp, HistogramProtoToFloatHistogram(fh)
 	case chunkenc.ValFloatHistogram:
-		fh := c.series.histograms[c.histogramsCur]
-		return fh.Timestamp, FloatHistogramProtoToFloatHistogram(fh)
+		return c.series.histograms[c.histogramsCur].Timestamp, c.curFH
+	case chunkenc.ValHistogram:
+		return c.series.histograms[c.histogramsCur].Timestamp, c.curH.ToFloat(nil)
 	default:
 		panic("iterator is not on a histogram sample")
 	}
@@ -506,10 +572,19 @@ func (c *concreteSeriesIterator) AtT() int64 {
 	return c.series.floats[c.floatsCur].Timestamp
 }
 
+// TODO(krajorama,ywwg): implement AtST. Maybe. concreteSeriesIterator is used
+// for turning query results into an iterable, but query results do not have ST.
+func (*concreteSeriesIterator) AtST() int64 {
+	return 0
+}
+
 const noTS = int64(math.MaxInt64)
 
 // Next implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) Next() chunkenc.ValueType {
+	if c.err != nil {
+		return chunkenc.ValNone
+	}
 	peekFloatTS := noTS
 	if c.floatsCur+1 < len(c.series.floats) {
 		peekFloatTS = c.series.floats[c.floatsCur+1].Timestamp
@@ -538,22 +613,256 @@ func (c *concreteSeriesIterator) Next() chunkenc.ValueType {
 		c.histogramsCur++
 		c.curValType = chunkenc.ValFloat
 	}
+
+	if c.curValType == chunkenc.ValHistogram {
+		c.setCurrentHistogram()
+	}
+	if c.err != nil {
+		c.curValType = chunkenc.ValNone
+	}
 	return c.curValType
 }
 
 // Err implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) Err() error {
+	return c.err
+}
+
+// chunkedSeriesSet implements storage.SeriesSet.
+type chunkedSeriesSet struct {
+	chunkedReader *ChunkedReader
+	respBody      io.ReadCloser
+	mint, maxt    int64
+	cancel        func(error)
+
+	current   storage.Series
+	err       error
+	exhausted bool
+}
+
+func NewChunkedSeriesSet(chunkedReader *ChunkedReader, respBody io.ReadCloser, mint, maxt int64, cancel func(error)) storage.SeriesSet {
+	return &chunkedSeriesSet{
+		chunkedReader: chunkedReader,
+		respBody:      respBody,
+		mint:          mint,
+		maxt:          maxt,
+		cancel:        cancel,
+	}
+}
+
+// Next return true if there is a next series and false otherwise. It will
+// block until the next series is available.
+func (s *chunkedSeriesSet) Next() bool {
+	if s.exhausted {
+		// Don't try to read the next series again.
+		// This prevents errors like "http: read on closed response body" if Next() is called after it has already returned false.
+		return false
+	}
+
+	res := &prompb.ChunkedReadResponse{}
+
+	err := s.chunkedReader.NextProto(res)
+	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			s.err = err
+			_, _ = io.Copy(io.Discard, s.respBody)
+		}
+
+		_ = s.respBody.Close()
+		s.cancel(err)
+		s.exhausted = true
+
+		return false
+	}
+
+	s.current = &chunkedSeries{
+		ChunkedSeries: prompb.ChunkedSeries{
+			Labels: res.ChunkedSeries[0].Labels,
+			Chunks: res.ChunkedSeries[0].Chunks,
+		},
+		mint: s.mint,
+		maxt: s.maxt,
+	}
+
+	return true
+}
+
+func (s *chunkedSeriesSet) At() storage.Series {
+	return s.current
+}
+
+func (s *chunkedSeriesSet) Err() error {
+	return s.err
+}
+
+func (*chunkedSeriesSet) Warnings() annotations.Annotations {
 	return nil
+}
+
+type chunkedSeries struct {
+	prompb.ChunkedSeries
+	mint, maxt int64
+}
+
+var _ storage.Series = &chunkedSeries{}
+
+func (s *chunkedSeries) Labels() labels.Labels {
+	b := labels.NewScratchBuilder(0)
+	return s.ToLabels(&b, nil)
+}
+
+func (s *chunkedSeries) Iterator(it chunkenc.Iterator) chunkenc.Iterator {
+	csIt, ok := it.(*chunkedSeriesIterator)
+	if ok {
+		csIt.reset(s.Chunks, s.mint, s.maxt)
+		return csIt
+	}
+	return newChunkedSeriesIterator(s.Chunks, s.mint, s.maxt)
+}
+
+type chunkedSeriesIterator struct {
+	chunks     []prompb.Chunk
+	idx        int
+	cur        chunkenc.Iterator
+	valType    chunkenc.ValueType
+	mint, maxt int64
+
+	err error
+}
+
+var _ chunkenc.Iterator = &chunkedSeriesIterator{}
+
+func newChunkedSeriesIterator(chunks []prompb.Chunk, mint, maxt int64) *chunkedSeriesIterator {
+	it := &chunkedSeriesIterator{}
+	it.reset(chunks, mint, maxt)
+	return it
+}
+
+func (it *chunkedSeriesIterator) Next() chunkenc.ValueType {
+	if it.err != nil {
+		return chunkenc.ValNone
+	}
+	if len(it.chunks) == 0 {
+		return chunkenc.ValNone
+	}
+
+	for it.valType = it.cur.Next(); it.valType != chunkenc.ValNone; it.valType = it.cur.Next() {
+		atT := it.AtT()
+		if atT > it.maxt {
+			it.chunks = nil // Exhaust this iterator so follow-up calls to Next or Seek return fast.
+			return chunkenc.ValNone
+		}
+		if atT >= it.mint {
+			return it.valType
+		}
+	}
+
+	if it.idx >= len(it.chunks)-1 {
+		it.valType = chunkenc.ValNone
+	} else {
+		it.idx++
+		it.resetIterator()
+		it.valType = it.Next()
+	}
+
+	return it.valType
+}
+
+func (it *chunkedSeriesIterator) Seek(t int64) chunkenc.ValueType {
+	if it.err != nil {
+		return chunkenc.ValNone
+	}
+	if len(it.chunks) == 0 {
+		return chunkenc.ValNone
+	}
+
+	startIdx := it.idx
+	it.idx += sort.Search(len(it.chunks)-startIdx, func(i int) bool {
+		return it.chunks[startIdx+i].MaxTimeMs >= t
+	})
+	if it.idx > startIdx {
+		it.resetIterator()
+	} else {
+		ts := it.cur.AtT()
+		if ts >= t {
+			return it.valType
+		}
+	}
+
+	for it.valType = it.cur.Next(); it.valType != chunkenc.ValNone; it.valType = it.cur.Next() {
+		ts := it.cur.AtT()
+		if ts > it.maxt {
+			it.chunks = nil // Exhaust this iterator so follow-up calls to Next or Seek return fast.
+			return chunkenc.ValNone
+		}
+		if ts >= t && ts >= it.mint {
+			return it.valType
+		}
+	}
+
+	it.valType = chunkenc.ValNone
+	return it.valType
+}
+
+func (it *chunkedSeriesIterator) resetIterator() {
+	if it.idx < len(it.chunks) {
+		chunk := it.chunks[it.idx]
+
+		decodedChunk, err := chunkenc.FromData(chunkenc.Encoding(chunk.Type), chunk.Data)
+		if err != nil {
+			it.err = err
+			return
+		}
+
+		it.cur = decodedChunk.Iterator(nil)
+	} else {
+		it.cur = chunkenc.NewNopIterator()
+	}
+}
+
+func (it *chunkedSeriesIterator) reset(chunks []prompb.Chunk, mint, maxt int64) {
+	it.chunks = chunks
+	it.mint = mint
+	it.maxt = maxt
+	it.idx = 0
+	if len(chunks) > 0 {
+		it.resetIterator()
+	}
+}
+
+func (it *chunkedSeriesIterator) At() (ts int64, v float64) {
+	return it.cur.At()
+}
+
+func (it *chunkedSeriesIterator) AtHistogram(h *histogram.Histogram) (int64, *histogram.Histogram) {
+	return it.cur.AtHistogram(h)
+}
+
+func (it *chunkedSeriesIterator) AtFloatHistogram(fh *histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return it.cur.AtFloatHistogram(fh)
+}
+
+func (it *chunkedSeriesIterator) AtT() int64 {
+	return it.cur.AtT()
+}
+
+// TODO(krajorama,ywwg): test AtST once we have a chunk format that provides ST.
+func (it *chunkedSeriesIterator) AtST() int64 {
+	return it.cur.AtST()
+}
+
+func (it *chunkedSeriesIterator) Err() error {
+	return it.err
 }
 
 // validateLabelsAndMetricName validates the label names/values and metric names returned from remote read,
 // also making sure that there are no labels with duplicate names.
 func validateLabelsAndMetricName(ls []prompb.Label) error {
 	for i, l := range ls {
-		if l.Name == labels.MetricName && !model.IsValidMetricName(model.LabelValue(l.Value)) {
+		if l.Name == labels.MetricName && !model.UTF8Validation.IsValidMetricName(l.Value) {
 			return fmt.Errorf("invalid metric name: %v", l.Value)
 		}
-		if !model.LabelName(l.Name).IsValid() {
+		if !model.UTF8Validation.IsValidLabelName(l.Name) {
 			return fmt.Errorf("invalid label name: %v", l.Name)
 		}
 		if !model.LabelValue(l.Value).IsValid() {
@@ -566,7 +875,8 @@ func validateLabelsAndMetricName(ls []prompb.Label) error {
 	return nil
 }
 
-func toLabelMatchers(matchers []*labels.Matcher) ([]*prompb.LabelMatcher, error) {
+// ToLabelMatchers converts Prometheus label matchers to protobuf label matchers.
+func ToLabelMatchers(matchers []*labels.Matcher) ([]*prompb.LabelMatcher, error) {
 	pbMatchers := make([]*prompb.LabelMatcher, 0, len(matchers))
 	for _, m := range matchers {
 		var mType prompb.LabelMatcher_Type
@@ -591,7 +901,7 @@ func toLabelMatchers(matchers []*labels.Matcher) ([]*prompb.LabelMatcher, error)
 	return pbMatchers, nil
 }
 
-// FromLabelMatchers parses protobuf label matchers to Prometheus label matchers.
+// FromLabelMatchers converts protobuf label matchers to Prometheus label matchers.
 func FromLabelMatchers(matchers []*prompb.LabelMatcher) ([]*labels.Matcher, error) {
 	result := make([]*labels.Matcher, 0, len(matchers))
 	for _, matcher := range matchers {
@@ -617,185 +927,9 @@ func FromLabelMatchers(matchers []*prompb.LabelMatcher) ([]*labels.Matcher, erro
 	return result, nil
 }
 
-func exemplarProtoToExemplar(b *labels.ScratchBuilder, ep prompb.Exemplar) exemplar.Exemplar {
-	timestamp := ep.Timestamp
-
-	return exemplar.Exemplar{
-		Labels: labelProtosToLabels(b, ep.Labels),
-		Value:  ep.Value,
-		Ts:     timestamp,
-		HasTs:  timestamp != 0,
-	}
-}
-
-// HistogramProtoToHistogram extracts a (normal integer) Histogram from the
-// provided proto message. The caller has to make sure that the proto message
-// represents an integer histogram and not a float histogram, or it panics.
-func HistogramProtoToHistogram(hp prompb.Histogram) *histogram.Histogram {
-	if hp.IsFloatHistogram() {
-		panic("HistogramProtoToHistogram called with a float histogram")
-	}
-	return &histogram.Histogram{
-		CounterResetHint: histogram.CounterResetHint(hp.ResetHint),
-		Schema:           hp.Schema,
-		ZeroThreshold:    hp.ZeroThreshold,
-		ZeroCount:        hp.GetZeroCountInt(),
-		Count:            hp.GetCountInt(),
-		Sum:              hp.Sum,
-		PositiveSpans:    spansProtoToSpans(hp.GetPositiveSpans()),
-		PositiveBuckets:  hp.GetPositiveDeltas(),
-		NegativeSpans:    spansProtoToSpans(hp.GetNegativeSpans()),
-		NegativeBuckets:  hp.GetNegativeDeltas(),
-	}
-}
-
-// FloatHistogramProtoToFloatHistogram extracts a float Histogram from the
-// provided proto message to a Float Histogram. The caller has to make sure that
-// the proto message represents a float histogram and not an integer histogram,
-// or it panics.
-func FloatHistogramProtoToFloatHistogram(hp prompb.Histogram) *histogram.FloatHistogram {
-	if !hp.IsFloatHistogram() {
-		panic("FloatHistogramProtoToFloatHistogram called with an integer histogram")
-	}
-	return &histogram.FloatHistogram{
-		CounterResetHint: histogram.CounterResetHint(hp.ResetHint),
-		Schema:           hp.Schema,
-		ZeroThreshold:    hp.ZeroThreshold,
-		ZeroCount:        hp.GetZeroCountFloat(),
-		Count:            hp.GetCountFloat(),
-		Sum:              hp.Sum,
-		PositiveSpans:    spansProtoToSpans(hp.GetPositiveSpans()),
-		PositiveBuckets:  hp.GetPositiveCounts(),
-		NegativeSpans:    spansProtoToSpans(hp.GetNegativeSpans()),
-		NegativeBuckets:  hp.GetNegativeCounts(),
-	}
-}
-
-// HistogramProtoToFloatHistogram extracts and converts a (normal integer) histogram from the provided proto message
-// to a float histogram. The caller has to make sure that the proto message represents an integer histogram and not a
-// float histogram, or it panics.
-func HistogramProtoToFloatHistogram(hp prompb.Histogram) *histogram.FloatHistogram {
-	if hp.IsFloatHistogram() {
-		panic("HistogramProtoToFloatHistogram called with a float histogram")
-	}
-	return &histogram.FloatHistogram{
-		CounterResetHint: histogram.CounterResetHint(hp.ResetHint),
-		Schema:           hp.Schema,
-		ZeroThreshold:    hp.ZeroThreshold,
-		ZeroCount:        float64(hp.GetZeroCountInt()),
-		Count:            float64(hp.GetCountInt()),
-		Sum:              hp.Sum,
-		PositiveSpans:    spansProtoToSpans(hp.GetPositiveSpans()),
-		PositiveBuckets:  deltasToCounts(hp.GetPositiveDeltas()),
-		NegativeSpans:    spansProtoToSpans(hp.GetNegativeSpans()),
-		NegativeBuckets:  deltasToCounts(hp.GetNegativeDeltas()),
-	}
-}
-
-func spansProtoToSpans(s []prompb.BucketSpan) []histogram.Span {
-	spans := make([]histogram.Span, len(s))
-	for i := 0; i < len(s); i++ {
-		spans[i] = histogram.Span{Offset: s[i].Offset, Length: s[i].Length}
-	}
-
-	return spans
-}
-
-func deltasToCounts(deltas []int64) []float64 {
-	counts := make([]float64, len(deltas))
-	var cur float64
-	for i, d := range deltas {
-		cur += float64(d)
-		counts[i] = cur
-	}
-	return counts
-}
-
-func HistogramToHistogramProto(timestamp int64, h *histogram.Histogram) prompb.Histogram {
-	return prompb.Histogram{
-		Count:          &prompb.Histogram_CountInt{CountInt: h.Count},
-		Sum:            h.Sum,
-		Schema:         h.Schema,
-		ZeroThreshold:  h.ZeroThreshold,
-		ZeroCount:      &prompb.Histogram_ZeroCountInt{ZeroCountInt: h.ZeroCount},
-		NegativeSpans:  spansToSpansProto(h.NegativeSpans),
-		NegativeDeltas: h.NegativeBuckets,
-		PositiveSpans:  spansToSpansProto(h.PositiveSpans),
-		PositiveDeltas: h.PositiveBuckets,
-		ResetHint:      prompb.Histogram_ResetHint(h.CounterResetHint),
-		Timestamp:      timestamp,
-	}
-}
-
-func FloatHistogramToHistogramProto(timestamp int64, fh *histogram.FloatHistogram) prompb.Histogram {
-	return prompb.Histogram{
-		Count:          &prompb.Histogram_CountFloat{CountFloat: fh.Count},
-		Sum:            fh.Sum,
-		Schema:         fh.Schema,
-		ZeroThreshold:  fh.ZeroThreshold,
-		ZeroCount:      &prompb.Histogram_ZeroCountFloat{ZeroCountFloat: fh.ZeroCount},
-		NegativeSpans:  spansToSpansProto(fh.NegativeSpans),
-		NegativeCounts: fh.NegativeBuckets,
-		PositiveSpans:  spansToSpansProto(fh.PositiveSpans),
-		PositiveCounts: fh.PositiveBuckets,
-		ResetHint:      prompb.Histogram_ResetHint(fh.CounterResetHint),
-		Timestamp:      timestamp,
-	}
-}
-
-func spansToSpansProto(s []histogram.Span) []prompb.BucketSpan {
-	spans := make([]prompb.BucketSpan, len(s))
-	for i := 0; i < len(s); i++ {
-		spans[i] = prompb.BucketSpan{Offset: s[i].Offset, Length: s[i].Length}
-	}
-
-	return spans
-}
-
-// LabelProtosToMetric unpack a []*prompb.Label to a model.Metric.
-func LabelProtosToMetric(labelPairs []*prompb.Label) model.Metric {
-	metric := make(model.Metric, len(labelPairs))
-	for _, l := range labelPairs {
-		metric[model.LabelName(l.Name)] = model.LabelValue(l.Value)
-	}
-	return metric
-}
-
-func labelProtosToLabels(b *labels.ScratchBuilder, labelPairs []prompb.Label) labels.Labels {
-	b.Reset()
-	for _, l := range labelPairs {
-		b.Add(l.Name, l.Value)
-	}
-	b.Sort()
-	return b.Labels()
-}
-
-// labelsToLabelsProto transforms labels into prompb labels. The buffer slice
-// will be used to avoid allocations if it is big enough to store the labels.
-func labelsToLabelsProto(lbls labels.Labels, buf []prompb.Label) []prompb.Label {
-	result := buf[:0]
-	lbls.Range(func(l labels.Label) {
-		result = append(result, prompb.Label{
-			Name:  l.Name,
-			Value: l.Value,
-		})
-	})
-	return result
-}
-
-// metricTypeToMetricTypeProto transforms a Prometheus metricType into prompb metricType. Since the former is a string we need to transform it to an enum.
-func metricTypeToMetricTypeProto(t model.MetricType) prompb.MetricMetadata_MetricType {
-	mt := strings.ToUpper(string(t))
-	v, ok := prompb.MetricMetadata_MetricType_value[mt]
-	if !ok {
-		return prompb.MetricMetadata_UNKNOWN
-	}
-
-	return prompb.MetricMetadata_MetricType(v)
-}
-
 // DecodeWriteRequest from an io.Reader into a prompb.WriteRequest, handling
 // snappy decompression.
+// Used also by documentation/examples/remote_storage.
 func DecodeWriteRequest(r io.Reader) (*prompb.WriteRequest, error) {
 	compressed, err := io.ReadAll(r)
 	if err != nil {
@@ -808,6 +942,28 @@ func DecodeWriteRequest(r io.Reader) (*prompb.WriteRequest, error) {
 	}
 
 	var req prompb.WriteRequest
+	if err := proto.Unmarshal(reqBuf, &req); err != nil {
+		return nil, err
+	}
+
+	return &req, nil
+}
+
+// DecodeWriteV2Request from an io.Reader into a writev2.Request, handling
+// snappy decompression.
+// Used also by documentation/examples/remote_storage.
+func DecodeWriteV2Request(r io.Reader) (*writev2.Request, error) {
+	compressed, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+
+	reqBuf, err := snappy.Decode(nil, compressed)
+	if err != nil {
+		return nil, err
+	}
+
+	var req writev2.Request
 	if err := proto.Unmarshal(reqBuf, &req); err != nil {
 		return nil, err
 	}
@@ -852,7 +1008,7 @@ func DecodeOTLPWriteRequest(r *http.Request) (pmetricotlp.ExportRequest, error) 
 		return pmetricotlp.NewExportRequest(), fmt.Errorf("unsupported compression: %s. Only \"gzip\" or no compression supported", r.Header.Get("Content-Encoding"))
 	}
 
-	body, err := io.ReadAll(reader)
+	body, err := io.ReadAll(io.LimitReader(reader, decodeReadLimit))
 	if err != nil {
 		r.Body.Close()
 		return pmetricotlp.NewExportRequest(), err

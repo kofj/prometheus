@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,26 +24,32 @@ type Pool struct {
 	buckets []sync.Pool
 	sizes   []int
 	// make is the function used to create an empty slice when none exist yet.
-	make func(int) interface{}
+	make func(int) any
 }
 
 // New returns a new Pool with size buckets for minSize to maxSize
 // increasing by the given factor.
-func New(minSize, maxSize int, factor float64, makeFunc func(int) interface{}) *Pool {
+func New(minSize, maxSize int, factor float64, makeFunc func(int) any) *Pool {
 	if minSize < 1 {
 		panic("invalid minimum pool size")
 	}
 	if maxSize < 1 {
 		panic("invalid maximum pool size")
 	}
-	if factor < 1 {
+	if factor <= 1 {
 		panic("invalid factor")
 	}
 
 	var sizes []int
 
-	for s := minSize; s <= maxSize; s = int(float64(s) * factor) {
+	for s := minSize; s <= maxSize; {
 		sizes = append(sizes, s)
+		next := int(float64(s) * factor)
+		if next <= s {
+			// A factor barely above 1 can round back to s, which would loop forever.
+			next = s + 1
+		}
+		s = next
 	}
 
 	p := &Pool{
@@ -56,7 +62,7 @@ func New(minSize, maxSize int, factor float64, makeFunc func(int) interface{}) *
 }
 
 // Get returns a new byte slices that fits the given size.
-func (p *Pool) Get(sz int) interface{} {
+func (p *Pool) Get(sz int) any {
 	for i, bktSize := range p.sizes {
 		if sz > bktSize {
 			continue
@@ -71,7 +77,7 @@ func (p *Pool) Get(sz int) interface{} {
 }
 
 // Put adds a slice to the right bucket in the pool.
-func (p *Pool) Put(s interface{}) {
+func (p *Pool) Put(s any) {
 	slice := reflect.ValueOf(s)
 
 	if slice.Kind() != reflect.Slice {

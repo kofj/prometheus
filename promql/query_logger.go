@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,7 +16,10 @@ package promql
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -24,17 +27,17 @@ import (
 	"unicode/utf8"
 
 	"github.com/edsrzf/mmap-go"
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 )
 
 type ActiveQueryTracker struct {
-	mmapedFile    []byte
+	mmappedFile   []byte
 	getNextIndex  chan int
-	logger        log.Logger
+	logger        *slog.Logger
 	closer        io.Closer
 	maxConcurrent int
 }
+
+var _ io.Closer = &ActiveQueryTracker{}
 
 type Entry struct {
 	Query     string `json:"query"`
@@ -47,7 +50,7 @@ const (
 
 func parseBrokenJSON(brokenJSON []byte) (string, bool) {
 	queries := strings.ReplaceAll(string(brokenJSON), "\x00", "")
-	if len(queries) > 0 {
+	if queries != "" {
 		queries = queries[:len(queries)-1] + "]"
 	}
 
@@ -59,11 +62,36 @@ func parseBrokenJSON(brokenJSON []byte) (string, bool) {
 	return queries, true
 }
 
-func logUnfinishedQueries(filename string, filesize int, logger log.Logger) {
+type syncWriter interface {
+	io.Writer
+	Sync() error
+}
+
+func allocateQueryLogFile(file syncWriter, filesize int) error {
+	zeroes := make([]byte, min(filesize, 32*1024))
+	remaining := filesize
+	for remaining > 0 {
+		writeBytes := zeroes
+		if remaining < len(writeBytes) {
+			writeBytes = writeBytes[:remaining]
+		}
+		n, err := file.Write(writeBytes)
+		if err != nil {
+			return err
+		}
+		if n != len(writeBytes) {
+			return io.ErrShortWrite
+		}
+		remaining -= n
+	}
+	return file.Sync()
+}
+
+func logUnfinishedQueries(filename string, filesize int, logger *slog.Logger) {
 	if _, err := os.Stat(filename); err == nil {
 		fd, err := os.Open(filename)
 		if err != nil {
-			level.Error(logger).Log("msg", "Failed to open query log file", "err", err)
+			logger.Error("Failed to open query log file", "err", err)
 			return
 		}
 		defer fd.Close()
@@ -71,7 +99,7 @@ func logUnfinishedQueries(filename string, filesize int, logger log.Logger) {
 		brokenJSON := make([]byte, filesize)
 		_, err = fd.Read(brokenJSON)
 		if err != nil {
-			level.Error(logger).Log("msg", "Failed to read query log file", "err", err)
+			logger.Error("Failed to read query log file", "err", err)
 			return
 		}
 
@@ -79,53 +107,72 @@ func logUnfinishedQueries(filename string, filesize int, logger log.Logger) {
 		if !queriesExist {
 			return
 		}
-		level.Info(logger).Log("msg", "These queries didn't finish in prometheus' last run:", "queries", queries)
+		logger.Info("These queries didn't finish in prometheus' last run:", "queries", queries)
 	}
 }
 
-func getMMapedFile(filename string, filesize int, logger log.Logger) ([]byte, io.Closer, error) {
+type mmappedFile struct {
+	f io.Closer
+	m mmap.MMap
+}
+
+func (f *mmappedFile) Close() error {
+	err := f.m.Unmap()
+	if err != nil {
+		err = fmt.Errorf("mmappedFile: unmapping: %w", err)
+	}
+	if fErr := f.f.Close(); fErr != nil {
+		return errors.Join(fmt.Errorf("close mmappedFile.f: %w", fErr), err)
+	}
+
+	return err
+}
+
+func getMMappedFile(filename string, filesize int, logger *slog.Logger) ([]byte, io.Closer, error) {
 	file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o666)
 	if err != nil {
 		absPath, pathErr := filepath.Abs(filename)
 		if pathErr != nil {
 			absPath = filename
 		}
-		level.Error(logger).Log("msg", "Error opening query log file", "file", absPath, "err", err)
+		logger.Error("Error opening query log file", "file", absPath, "err", err)
 		return nil, nil, err
 	}
 
-	err = file.Truncate(int64(filesize))
-	if err != nil {
-		level.Error(logger).Log("msg", "Error setting filesize.", "filesize", filesize, "err", err)
+	if err := allocateQueryLogFile(file, filesize); err != nil {
+		file.Close()
+		logger.Error("Error allocating query log file.", "filesize", filesize, "err", err)
 		return nil, nil, err
 	}
 
 	fileAsBytes, err := mmap.Map(file, mmap.RDWR, 0)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to mmap", "file", filename, "Attempted size", filesize, "err", err)
+		file.Close()
+		logger.Error("Failed to mmap", "file", filename, "Attempted size", filesize, "err", err)
 		return nil, nil, err
 	}
 
-	return fileAsBytes, file, err
+	return fileAsBytes, &mmappedFile{f: file, m: fileAsBytes}, err
 }
 
-func NewActiveQueryTracker(localStoragePath string, maxConcurrent int, logger log.Logger) *ActiveQueryTracker {
+func NewActiveQueryTracker(localStoragePath string, maxConcurrent int, logger *slog.Logger) (*ActiveQueryTracker, error) {
 	err := os.MkdirAll(localStoragePath, 0o777)
 	if err != nil {
-		level.Error(logger).Log("msg", "Failed to create directory for logging active queries")
+		logger.Error("Failed to create directory for logging active queries", "err", err)
+		return nil, fmt.Errorf("create active query log directory: %w", err)
 	}
 
 	filename, filesize := filepath.Join(localStoragePath, "queries.active"), 1+maxConcurrent*entrySize
 	logUnfinishedQueries(filename, filesize, logger)
 
-	fileAsBytes, closer, err := getMMapedFile(filename, filesize, logger)
+	fileAsBytes, closer, err := getMMappedFile(filename, filesize, logger)
 	if err != nil {
-		panic("Unable to create mmap-ed active query log")
+		return nil, fmt.Errorf("create mmap-ed active query log: %w", err)
 	}
 
 	copy(fileAsBytes, "[")
 	activeQueryTracker := ActiveQueryTracker{
-		mmapedFile:    fileAsBytes,
+		mmappedFile:   fileAsBytes,
 		closer:        closer,
 		getNextIndex:  make(chan int, maxConcurrent),
 		logger:        logger,
@@ -134,7 +181,7 @@ func NewActiveQueryTracker(localStoragePath string, maxConcurrent int, logger lo
 
 	activeQueryTracker.generateIndices(maxConcurrent)
 
-	return &activeQueryTracker
+	return &activeQueryTracker, nil
 }
 
 func trimStringByBytes(str string, size int) string {
@@ -142,7 +189,7 @@ func trimStringByBytes(str string, size int) string {
 
 	trimIndex := len(bytesStr)
 	if size < len(bytesStr) {
-		for !utf8.RuneStart(bytesStr[size]) {
+		for size > 0 && !utf8.RuneStart(bytesStr[size]) {
 			size--
 		}
 		trimIndex = size
@@ -151,18 +198,18 @@ func trimStringByBytes(str string, size int) string {
 	return string(bytesStr[:trimIndex])
 }
 
-func _newJSONEntry(query string, timestamp int64, logger log.Logger) []byte {
+func _newJSONEntry(query string, timestamp int64, logger *slog.Logger) []byte {
 	entry := Entry{query, timestamp}
 	jsonEntry, err := json.Marshal(entry)
 	if err != nil {
-		level.Error(logger).Log("msg", "Cannot create json of query", "query", query)
+		logger.Error("Cannot create json of query", "query", query)
 		return []byte{}
 	}
 
 	return jsonEntry
 }
 
-func newJSONEntry(query string, logger log.Logger) []byte {
+func newJSONEntry(query string, logger *slog.Logger) []byte {
 	timestamp := time.Now().Unix()
 	minEntryJSON := _newJSONEntry("", timestamp, logger)
 
@@ -173,7 +220,7 @@ func newJSONEntry(query string, logger log.Logger) []byte {
 }
 
 func (tracker ActiveQueryTracker) generateIndices(maxConcurrent int) {
-	for i := 0; i < maxConcurrent; i++ {
+	for i := range maxConcurrent {
 		tracker.getNextIndex <- 1 + (i * entrySize)
 	}
 }
@@ -183,14 +230,14 @@ func (tracker ActiveQueryTracker) GetMaxConcurrent() int {
 }
 
 func (tracker ActiveQueryTracker) Delete(insertIndex int) {
-	copy(tracker.mmapedFile[insertIndex:], strings.Repeat("\x00", entrySize))
+	copy(tracker.mmappedFile[insertIndex:], strings.Repeat("\x00", entrySize))
 	tracker.getNextIndex <- insertIndex
 }
 
 func (tracker ActiveQueryTracker) Insert(ctx context.Context, query string) (int, error) {
 	select {
 	case i := <-tracker.getNextIndex:
-		fileBytes := tracker.mmapedFile
+		fileBytes := tracker.mmappedFile
 		entry := newJSONEntry(query, tracker.logger)
 		start, end := i, i+entrySize
 
@@ -202,9 +249,13 @@ func (tracker ActiveQueryTracker) Insert(ctx context.Context, query string) (int
 	}
 }
 
-func (tracker *ActiveQueryTracker) Close() {
+// Close closes tracker.
+func (tracker *ActiveQueryTracker) Close() error {
 	if tracker == nil || tracker.closer == nil {
-		return
+		return nil
 	}
-	tracker.closer.Close()
+	if err := tracker.closer.Close(); err != nil {
+		return fmt.Errorf("close ActiveQueryTracker.closer: %w", err)
+	}
+	return nil
 }

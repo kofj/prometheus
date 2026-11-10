@@ -1,4 +1,4 @@
-// Copyright 2013 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,24 +15,36 @@ package rules
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
+	"sync"
 	"time"
 
 	"go.uber.org/atomic"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/schema"
 )
+
+var _ Rule = (*RecordingRule)(nil)
+
+// ErrDuplicateRecordingLabelSet is returned when a recording rule evaluation produces
+// metrics with identical labelsets after applying rule labels.
+var ErrDuplicateRecordingLabelSet = errors.New("vector contains metrics with the same labelset after applying rule labels")
 
 // A RecordingRule records its vector expression into new timeseries.
 type RecordingRule struct {
 	name   string
 	vector parser.Expr
 	labels labels.Labels
+	meta   metadata.Metadata
 	// The health of the recording rule.
 	health *atomic.String
 	// Timestamp of last evaluation of the recording rule.
@@ -42,22 +54,27 @@ type RecordingRule struct {
 	// Duration of how long it took to evaluate the recording rule.
 	evaluationDuration *atomic.Duration
 
-	noDependentRules  *atomic.Bool
-	noDependencyRules *atomic.Bool
+	dependenciesMutex sync.RWMutex
+	dependentRules    []Rule
+	dependencyRules   []Rule
 }
 
 // NewRecordingRule returns a new recording rule.
 func NewRecordingRule(name string, vector parser.Expr, lset labels.Labels) *RecordingRule {
+	return NewRecordingRuleWithMetadata(name, vector, lset, metadata.Metadata{})
+}
+
+// NewRecordingRuleWithMetadata returns a new recording rule with configured metric metadata.
+func NewRecordingRuleWithMetadata(name string, vector parser.Expr, lset labels.Labels, meta metadata.Metadata) *RecordingRule {
 	return &RecordingRule{
 		name:                name,
 		vector:              vector,
 		labels:              lset,
+		meta:                meta,
 		health:              atomic.NewString(string(HealthUnknown)),
 		evaluationTimestamp: atomic.NewTime(time.Time{}),
 		evaluationDuration:  atomic.NewDuration(0),
 		lastError:           atomic.NewError(nil),
-		noDependentRules:    atomic.NewBool(false),
-		noDependencyRules:   atomic.NewBool(false),
 	}
 }
 
@@ -76,27 +93,32 @@ func (rule *RecordingRule) Labels() labels.Labels {
 	return rule.labels
 }
 
-// Eval evaluates the rule and then overrides the metric names and labels accordingly.
-func (rule *RecordingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, _ *url.URL, limit int) (promql.Vector, error) {
-	ctx = NewOriginContext(ctx, NewRuleDetail(rule))
+// Metadata returns the configured metric metadata for the recording rule.
+func (rule *RecordingRule) Metadata() metadata.Metadata {
+	return rule.meta
+}
 
-	vector, err := query(ctx, rule.vector.String(), ts)
+// Eval evaluates the rule and then overrides the metric names and labels accordingly.
+func (rule *RecordingRule) Eval(ctx context.Context, queryOffset time.Duration, ts time.Time, query QueryFunc, _ *url.URL, limit int) (promql.Vector, error) {
+	ctx = NewOriginContext(ctx, NewRuleDetail(rule))
+	vector, err := query(ctx, rule.vector.String(), ts.Add(-queryOffset))
 	if err != nil {
 		return nil, err
 	}
 
-	// Override the metric name and labels.
+	// Override the metric name, apply rule labels, and strip reserved schema labels.
 	lb := labels.NewBuilder(labels.EmptyLabels())
 
 	for i := range vector {
 		sample := &vector[i]
 
 		lb.Reset(sample.Metric)
-		lb.Set(labels.MetricName, rule.name)
-
 		rule.labels.Range(func(l labels.Label) {
 			lb.Set(l.Name, l.Value)
 		})
+		// Strip any reserved __type__ and __unit__ labels and set __name__.
+		// Group.Eval injects configured __type__ and __unit__ when type-and-unit-labels is enabled.
+		schema.Metadata{Name: rule.name}.SetToLabels(lb)
 
 		sample.Metric = lb.Labels()
 	}
@@ -104,7 +126,7 @@ func (rule *RecordingRule) Eval(ctx context.Context, ts time.Time, query QueryFu
 	// Check that the rule does not produce identical metrics after applying
 	// labels.
 	if vector.ContainsSameLabelset() {
-		return nil, fmt.Errorf("vector contains metrics with the same labelset after applying rule labels")
+		return nil, ErrDuplicateRecordingLabelSet
 	}
 
 	numSeries := len(vector)
@@ -117,11 +139,24 @@ func (rule *RecordingRule) Eval(ctx context.Context, ts time.Time, query QueryFu
 	return vector, nil
 }
 
+// LogValue returns the rule's representation for logging.
+func (rule *RecordingRule) LogValue() slog.Value {
+	if rule == nil {
+		return slog.AnyValue(nil)
+	}
+	return slog.StringValue(rule.String())
+}
+
 func (rule *RecordingRule) String() string {
+	var meta *metadata.Metadata
+	if rule.meta != (metadata.Metadata{}) {
+		meta = &rule.meta
+	}
 	r := rulefmt.Rule{
-		Record: rule.name,
-		Expr:   rule.vector.String(),
-		Labels: rule.labels.Map(),
+		Record:   rule.name,
+		Expr:     rule.vector.String(),
+		Labels:   rule.labels.Map(),
+		Metadata: meta,
 	}
 
 	byt, err := yaml.Marshal(r)
@@ -172,18 +207,52 @@ func (rule *RecordingRule) GetEvaluationTimestamp() time.Time {
 	return rule.evaluationTimestamp.Load()
 }
 
-func (rule *RecordingRule) SetNoDependentRules(noDependentRules bool) {
-	rule.noDependentRules.Store(noDependentRules)
+func (rule *RecordingRule) SetDependentRules(dependents []Rule) {
+	rule.dependenciesMutex.Lock()
+	defer rule.dependenciesMutex.Unlock()
+
+	rule.dependentRules = make([]Rule, len(dependents))
+	copy(rule.dependentRules, dependents)
 }
 
 func (rule *RecordingRule) NoDependentRules() bool {
-	return rule.noDependentRules.Load()
+	rule.dependenciesMutex.RLock()
+	defer rule.dependenciesMutex.RUnlock()
+
+	if rule.dependentRules == nil {
+		return false // We don't know if there are dependent rules.
+	}
+
+	return len(rule.dependentRules) == 0
 }
 
-func (rule *RecordingRule) SetNoDependencyRules(noDependencyRules bool) {
-	rule.noDependencyRules.Store(noDependencyRules)
+func (rule *RecordingRule) DependentRules() []Rule {
+	rule.dependenciesMutex.RLock()
+	defer rule.dependenciesMutex.RUnlock()
+	return rule.dependentRules
+}
+
+func (rule *RecordingRule) SetDependencyRules(dependencies []Rule) {
+	rule.dependenciesMutex.Lock()
+	defer rule.dependenciesMutex.Unlock()
+
+	rule.dependencyRules = make([]Rule, len(dependencies))
+	copy(rule.dependencyRules, dependencies)
 }
 
 func (rule *RecordingRule) NoDependencyRules() bool {
-	return rule.noDependencyRules.Load()
+	rule.dependenciesMutex.RLock()
+	defer rule.dependenciesMutex.RUnlock()
+
+	if rule.dependencyRules == nil {
+		return false // We don't know if there are dependency rules.
+	}
+
+	return len(rule.dependencyRules) == 0
+}
+
+func (rule *RecordingRule) DependencyRules() []Rule {
+	rule.dependenciesMutex.RLock()
+	defer rule.dependenciesMutex.RUnlock()
+	return rule.dependencyRules
 }

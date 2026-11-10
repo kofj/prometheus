@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,38 +16,140 @@ package labels
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 )
 
+var (
+	s254 = strings.Repeat("x", 254) // Edge cases for stringlabels encoding.
+	s255 = strings.Repeat("x", 255)
+)
+
+var testCaseLabels = []Labels{
+	FromStrings("t1", "t1", "t2", "t2"),
+	{},
+	FromStrings("service.name", "t1", "whatever\\whatever", "t2"),
+	FromStrings("aaa", "111", "xx", s254),
+	FromStrings("aaa", "111", "xx", s255),
+	FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
+}
+
 func TestLabels_String(t *testing.T) {
-	cases := []struct {
-		lables   Labels
-		expected string
+	for _, tc := range []struct {
+		name            string
+		lbls            Labels
+		expectedString  string
+		expectedNoSpace string
 	}{
 		{
-			lables:   FromStrings("t1", "t1", "t2", "t2"),
-			expected: "{t1=\"t1\", t2=\"t2\"}",
+			name:            "two labels",
+			lbls:            FromStrings("t1", "t1", "t2", "t2"),
+			expectedString:  `{t1="t1", t2="t2"}`,
+			expectedNoSpace: `{t1="t1",t2="t2"}`,
 		},
 		{
-			lables:   Labels{},
-			expected: "{}",
+			name:            "empty",
+			lbls:            EmptyLabels(),
+			expectedString:  `{}`,
+			expectedNoSpace: `{}`,
 		},
-	}
-	for _, c := range cases {
-		str := c.lables.String()
-		require.Equal(t, c.expected, str)
+		{
+			name:            "dots and slashes",
+			lbls:            FromStrings("service.name", "t1", "whatever\\whatever", "t2"),
+			expectedString:  `{"service.name"="t1", "whatever\\whatever"="t2"}`,
+			expectedNoSpace: `{"service.name"="t1","whatever\\whatever"="t2"}`,
+		},
+		{
+			name:            "stringlabels 254 bytes edge case",
+			lbls:            FromStrings("aaa", "111", "xx", s254),
+			expectedString:  `{aaa="111", xx="` + s254 + `"}`,
+			expectedNoSpace: `{aaa="111",xx="` + s254 + `"}`,
+		},
+		{
+			name:            "stringlabels 255 bytes edge case",
+			lbls:            FromStrings("aaa", "111", "xx", s255),
+			expectedString:  `{aaa="111", xx="` + s255 + `"}`,
+			expectedNoSpace: `{aaa="111",xx="` + s255 + `"}`,
+		},
+		{
+			name:            "many labels with leading space names and special chars",
+			lbls:            FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
+			expectedString:  `{" container"="prometheus", " namespace"="observability-prometheus", __name__="kube_pod_container_status_last_terminated_exitcode", cluster="prod-af-north-0", instance="kube-state-metrics-0:kube-state-metrics:ksm", job="kube-state-metrics/kube-state-metrics", pod="observability-prometheus-0", uid="d3ec90b2-4975-4607-b45d-b9ad64bb417e"}`,
+			expectedNoSpace: `{" container"="prometheus"," namespace"="observability-prometheus",__name__="kube_pod_container_status_last_terminated_exitcode",cluster="prod-af-north-0",instance="kube-state-metrics-0:kube-state-metrics:ksm",job="kube-state-metrics/kube-state-metrics",pod="observability-prometheus-0",uid="d3ec90b2-4975-4607-b45d-b9ad64bb417e"}`,
+		},
+		{
+			name:            "spaces inside quoted values are preserved",
+			lbls:            FromStrings("a", "1, 2", "b", "3"),
+			expectedString:  `{a="1, 2", b="3"}`,
+			expectedNoSpace: `{a="1, 2",b="3"}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.expectedString, tc.lbls.String())
+			require.Equal(t, tc.expectedNoSpace, tc.lbls.StringNoSpace())
+		})
 	}
 }
 
 func BenchmarkString(b *testing.B) {
 	ls := New(benchmarkLabels...)
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = ls.String()
 	}
+}
+
+func BenchmarkStringNoSpace(b *testing.B) {
+	ls := New(benchmarkLabels...)
+	b.ReportAllocs()
+	for b.Loop() {
+		_ = ls.StringNoSpace()
+	}
+}
+
+func TestSizeOfLabels(t *testing.T) {
+	require.Len(t, expectedSizeOfLabels, len(testCaseLabels))
+	for i, c := range expectedSizeOfLabels { // Declared in build-tag-specific files, e.g. labels_slicelabels_test.go.
+		var total uint64
+		labels := testCaseLabels[i]
+		labels.Range(func(l Label) {
+			total += SizeOfLabels(l.Name, l.Value, 1)
+		})
+		require.Equalf(t, c, total, "unexpected size for test case %d: %v", i, labels)
+	}
+}
+
+func TestByteSize(t *testing.T) {
+	require.Len(t, expectedByteSize, len(testCaseLabels))
+	for i, c := range expectedByteSize { // Declared in build-tag-specific files, e.g. labels_slicelabels_test.go.
+		labels := testCaseLabels[i]
+		require.Equalf(t, c, labels.ByteSize(), "unexpected size for test case %d: %v", i, labels)
+	}
+}
+
+var GlobalTotal uint64 // Encourage the compiler not to elide the benchmark computation.
+
+func BenchmarkSize(b *testing.B) {
+	lb := New(benchmarkLabels...)
+	b.Run("SizeOfLabels", func(b *testing.B) {
+		for b.Loop() {
+			var total uint64
+			lb.Range(func(l Label) {
+				total += SizeOfLabels(l.Name, l.Value, 1)
+			})
+			GlobalTotal = total
+		}
+	})
+	b.Run("ByteSize", func(b *testing.B) {
+		for b.Loop() {
+			GlobalTotal = lb.ByteSize()
+		}
+	})
 }
 
 func TestLabels_MatchLabels(t *testing.T) {
@@ -57,7 +159,8 @@ func TestLabels_MatchLabels(t *testing.T) {
 		"alertstate", "pending",
 		"instance", "0",
 		"job", "app-server",
-		"severity", "critical")
+		"severity", "critical",
+	)
 
 	tests := []struct {
 		providedNames []string
@@ -77,7 +180,8 @@ func TestLabels_MatchLabels(t *testing.T) {
 				"__name__", "ALERTS",
 				"alertname", "HTTPRequestRateLow",
 				"alertstate", "pending",
-				"instance", "0"),
+				"instance", "0",
+			),
 		},
 		// on = false, explicitly excluding metric name from matching.
 		{
@@ -90,7 +194,8 @@ func TestLabels_MatchLabels(t *testing.T) {
 			on: false,
 			expected: FromStrings(
 				"job", "app-server",
-				"severity", "critical"),
+				"severity", "critical",
+			),
 		},
 		// on = true, explicitly excluding metric name from matching.
 		{
@@ -103,7 +208,8 @@ func TestLabels_MatchLabels(t *testing.T) {
 			expected: FromStrings(
 				"alertname", "HTTPRequestRateLow",
 				"alertstate", "pending",
-				"instance", "0"),
+				"instance", "0",
+			),
 		},
 		// on = false, implicitly excluding metric name from matching.
 		{
@@ -115,7 +221,8 @@ func TestLabels_MatchLabels(t *testing.T) {
 			on: false,
 			expected: FromStrings(
 				"job", "app-server",
-				"severity", "critical"),
+				"severity", "critical",
+			),
 		},
 	}
 
@@ -156,36 +263,42 @@ func TestLabels_WithoutEmpty(t *testing.T) {
 		{
 			input: FromStrings(
 				"foo", "",
-				"bar", ""),
+				"bar", "",
+			),
 			expected: EmptyLabels(),
 		},
 		{
 			input: FromStrings(
 				"foo", "",
 				"bar", "",
-				"baz", ""),
+				"baz", "",
+			),
 			expected: EmptyLabels(),
 		},
 		{
 			input: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
-				"job", "check"),
+				"job", "check",
+			),
 			expected: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
-				"job", "check"),
+				"job", "check",
+			),
 		},
 		{
 			input: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
 				"bar", "",
-				"job", "check"),
+				"job", "check",
+			),
 			expected: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
-				"job", "check"),
+				"job", "check",
+			),
 		},
 		{
 			input: FromStrings(
@@ -193,11 +306,13 @@ func TestLabels_WithoutEmpty(t *testing.T) {
 				"foo", "",
 				"hostname", "localhost",
 				"bar", "",
-				"job", "check"),
+				"job", "check",
+			),
 			expected: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
-				"job", "check"),
+				"job", "check",
+			),
 		},
 		{
 			input: FromStrings(
@@ -206,11 +321,13 @@ func TestLabels_WithoutEmpty(t *testing.T) {
 				"baz", "",
 				"hostname", "localhost",
 				"bar", "",
-				"job", "check"),
+				"job", "check",
+			),
 			expected: FromStrings(
 				"__name__", "test",
 				"hostname", "localhost",
-				"job", "check"),
+				"job", "check",
+			),
 		},
 	} {
 		t.Run("", func(t *testing.T) {
@@ -270,15 +387,72 @@ func TestLabels_IsValid(t *testing.T) {
 		},
 	} {
 		t.Run("", func(t *testing.T) {
-			require.Equal(t, test.expected, test.input.IsValid())
+			require.Equal(t, test.expected, test.input.IsValid(model.LegacyValidation))
 		})
+	}
+}
+
+func TestLabels_ValidationModes(t *testing.T) {
+	for _, test := range []struct {
+		input    Labels
+		callMode model.ValidationScheme
+		expected bool
+	}{
+		{
+			input: FromStrings(
+				"__name__", "test.metric",
+				"hostname", "localhost",
+				"job", "check",
+			),
+			callMode: model.UTF8Validation,
+			expected: true,
+		},
+		{
+			input: FromStrings(
+				"__name__", "test",
+				"host.name", "localhost",
+				"team/name", "platform",
+			),
+			callMode: model.UTF8Validation,
+			expected: true,
+		},
+		{
+			input: FromStrings(
+				"__name__", "test",
+				"\xc5 bad utf8", "localhost",
+				"job", "check",
+			),
+			callMode: model.UTF8Validation,
+			expected: false,
+		},
+		{
+			input: FromStrings(
+				"__name__", "test.utf8.metric",
+				"hostname", "localhost",
+				"job", "check",
+			),
+			callMode: model.LegacyValidation,
+			expected: false,
+		},
+		{
+			input: FromStrings(
+				"__name__", "test",
+				"host.name", "localhost",
+				"job", "check",
+			),
+			callMode: model.LegacyValidation,
+			expected: false,
+		},
+	} {
+		require.Equal(t, test.expected, test.input.IsValid(test.callMode))
 	}
 }
 
 func TestLabels_Equal(t *testing.T) {
 	labels := FromStrings(
 		"aaa", "111",
-		"bbb", "222")
+		"bbb", "222",
+	)
 
 	tests := []struct {
 		compared Labels
@@ -288,25 +462,29 @@ func TestLabels_Equal(t *testing.T) {
 			compared: FromStrings(
 				"aaa", "111",
 				"bbb", "222",
-				"ccc", "333"),
+				"ccc", "333",
+			),
 			expected: false,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bar", "222"),
+				"bar", "222",
+			),
 			expected: false,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbb", "233"),
+				"bbb", "233",
+			),
 			expected: false,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbb", "222"),
+				"bbb", "222",
+			),
 			expected: true,
 		},
 	}
@@ -338,7 +516,8 @@ func TestLabels_FromStrings(t *testing.T) {
 func TestLabels_Compare(t *testing.T) {
 	labels := FromStrings(
 		"aaa", "111",
-		"bbb", "222")
+		"bbb", "222",
+	)
 
 	tests := []struct {
 		compared Labels
@@ -347,42 +526,49 @@ func TestLabels_Compare(t *testing.T) {
 		{
 			compared: FromStrings(
 				"aaa", "110",
-				"bbb", "222"),
+				"bbb", "222",
+			),
 			expected: 1,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbb", "233"),
+				"bbb", "233",
+			),
 			expected: -1,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bar", "222"),
+				"bar", "222",
+			),
 			expected: 1,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbc", "222"),
+				"bbc", "222",
+			),
 			expected: -1,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bb", "222"),
+				"bb", "222",
+			),
 			expected: 1,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbbb", "222"),
+				"bbbb", "222",
+			),
 			expected: -1,
 		},
 		{
 			compared: FromStrings(
-				"aaa", "111"),
+				"aaa", "111",
+			),
 			expected: 1,
 		},
 		{
@@ -390,13 +576,15 @@ func TestLabels_Compare(t *testing.T) {
 				"aaa", "111",
 				"bbb", "222",
 				"ccc", "333",
-				"ddd", "444"),
+				"ddd", "444",
+			),
 			expected: -2,
 		},
 		{
 			compared: FromStrings(
 				"aaa", "111",
-				"bbb", "222"),
+				"bbb", "222",
+			),
 			expected: 0,
 		},
 		{
@@ -440,7 +628,8 @@ func TestLabels_Has(t *testing.T) {
 
 	labelsSet := FromStrings(
 		"aaa", "111",
-		"bbb", "222")
+		"bbb", "222",
+	)
 
 	for i, test := range tests {
 		got := labelsSet.Has(test.input)
@@ -449,7 +638,7 @@ func TestLabels_Has(t *testing.T) {
 }
 
 func TestLabels_Get(t *testing.T) {
-	require.Equal(t, "", FromStrings("aaa", "111", "bbb", "222").Get("foo"))
+	require.Empty(t, FromStrings("aaa", "111", "bbb", "222").Get("foo"))
 	require.Equal(t, "111", FromStrings("aaaa", "111", "bbb", "222").Get("aaaa"))
 	require.Equal(t, "222", FromStrings("aaaa", "111", "bbb", "222").Get("bbb"))
 }
@@ -459,9 +648,55 @@ func TestLabels_DropMetricName(t *testing.T) {
 	require.True(t, Equal(FromStrings("aaa", "111"), FromStrings(MetricName, "myname", "aaa", "111").DropMetricName()))
 
 	original := FromStrings("__aaa__", "111", MetricName, "myname", "bbb", "222")
-	check := FromStrings("__aaa__", "111", MetricName, "myname", "bbb", "222")
+	check := original.Copy()
 	require.True(t, Equal(FromStrings("__aaa__", "111", "bbb", "222"), check.DropMetricName()))
 	require.True(t, Equal(original, check))
+}
+
+func TestLabels_DropReserved(t *testing.T) {
+	shouldDropFn := func(n string) bool {
+		return n == MetricName || n == "__something__"
+	}
+	require.True(t, Equal(FromStrings("aaa", "111", "bbb", "222"), FromStrings("aaa", "111", "bbb", "222").DropReserved(shouldDropFn)))
+	require.True(t, Equal(FromStrings("aaa", "111"), FromStrings(MetricName, "myname", "aaa", "111").DropReserved(shouldDropFn)))
+	require.True(t, Equal(FromStrings("aaa", "111"), FromStrings(MetricName, "myname", "__something__", string(model.MetricTypeCounter), "aaa", "111").DropReserved(shouldDropFn)))
+
+	original := FromStrings("__aaa__", "111", MetricName, "myname", "bbb", "222")
+	check := original.Copy()
+	require.True(t, Equal(FromStrings("__aaa__", "111", "bbb", "222"), check.DropReserved(shouldDropFn)))
+	require.True(t, Equal(original, check))
+}
+
+func ScratchBuilderForBenchmark() ScratchBuilder {
+	// (Only relevant to -tags dedupelabels: stuff the symbol table before adding the real labels, to avoid having everything fitting into 1 byte.)
+	b := NewScratchBuilder(256)
+	for i := range 256 {
+		b.Add(fmt.Sprintf("name%d", i), fmt.Sprintf("value%d", i))
+	}
+	b.Labels()
+	b.Reset()
+	return b
+}
+
+func NewForBenchmark(ls ...Label) Labels {
+	b := ScratchBuilderForBenchmark()
+	for _, l := range ls {
+		b.Add(l.Name, l.Value)
+	}
+	b.Sort()
+	return b.Labels()
+}
+
+func FromStringsForBenchmark(ss ...string) Labels {
+	if len(ss)%2 != 0 {
+		panic("invalid number of strings")
+	}
+	b := ScratchBuilderForBenchmark()
+	for i := 0; i < len(ss); i += 2 {
+		b.Add(ss[i], ss[i+1])
+	}
+	b.Sort()
+	return b.Labels()
 }
 
 // BenchmarkLabels_Get was written to check whether a binary search can improve the performance vs the linear search implementation
@@ -481,12 +716,12 @@ func TestLabels_DropMetricName(t *testing.T) {
 func BenchmarkLabels_Get(b *testing.B) {
 	maxLabels := 30
 	allLabels := make([]Label, maxLabels)
-	for i := 0; i < maxLabels; i++ {
+	for i := range maxLabels {
 		allLabels[i] = Label{Name: strings.Repeat(string('a'+byte(i)), 5+(i%5))}
 	}
 	for _, size := range []int{5, 10, maxLabels} {
 		b.Run(fmt.Sprintf("with %d labels", size), func(b *testing.B) {
-			labels := New(allLabels[:size]...)
+			labels := NewForBenchmark(allLabels[:size]...)
 			for _, scenario := range []struct {
 				desc, label string
 			}{
@@ -497,12 +732,12 @@ func BenchmarkLabels_Get(b *testing.B) {
 			} {
 				b.Run(scenario.desc, func(b *testing.B) {
 					b.Run("get", func(b *testing.B) {
-						for i := 0; i < b.N; i++ {
+						for b.Loop() {
 							_ = labels.Get(scenario.label)
 						}
 					})
 					b.Run("has", func(b *testing.B) {
-						for i := 0; i < b.N; i++ {
+						for b.Loop() {
 							_ = labels.Has(scenario.label)
 						}
 					})
@@ -518,33 +753,33 @@ var comparisonBenchmarkScenarios = []struct {
 }{
 	{
 		"equal",
-		FromStrings("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
-		FromStrings("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
 	},
 	{
 		"not equal",
-		FromStrings("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
-		FromStrings("a_label_name", "a_label_value", "another_label_name", "a_different_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value", "another_label_name", "a_different_label_value"),
 	},
 	{
 		"different sizes",
-		FromStrings("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
-		FromStrings("a_label_name", "a_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value", "another_label_name", "another_label_value"),
+		FromStringsForBenchmark("a_label_name", "a_label_value"),
 	},
 	{
 		"lots",
-		FromStrings("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo", "ppp", "qqq", "rrz"),
-		FromStrings("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo", "ppp", "qqq", "rrr"),
+		FromStringsForBenchmark("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo", "ppp", "qqq", "rrz"),
+		FromStringsForBenchmark("aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh", "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo", "ppp", "qqq", "rrr"),
 	},
 	{
 		"real long equal",
-		FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
-		FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
+		FromStringsForBenchmark("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
+		FromStringsForBenchmark("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
 	},
 	{
 		"real long different end",
-		FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
-		FromStrings("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "deadbeef-0000-1111-2222-b9ad64bb417e"),
+		FromStringsForBenchmark("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "d3ec90b2-4975-4607-b45d-b9ad64bb417e"),
+		FromStringsForBenchmark("__name__", "kube_pod_container_status_last_terminated_exitcode", "cluster", "prod-af-north-0", " container", "prometheus", "instance", "kube-state-metrics-0:kube-state-metrics:ksm", "job", "kube-state-metrics/kube-state-metrics", " namespace", "observability-prometheus", "pod", "observability-prometheus-0", "uid", "deadbeef-0000-1111-2222-b9ad64bb417e"),
 	},
 }
 
@@ -552,7 +787,7 @@ func BenchmarkLabels_Equals(b *testing.B) {
 	for _, scenario := range comparisonBenchmarkScenarios {
 		b.Run(scenario.desc, func(b *testing.B) {
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				_ = Equal(scenario.base, scenario.other)
 			}
 		})
@@ -563,7 +798,7 @@ func BenchmarkLabels_Compare(b *testing.B) {
 	for _, scenario := range comparisonBenchmarkScenarios {
 		b.Run(scenario.desc, func(b *testing.B) {
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				_ = Compare(scenario.base, scenario.other)
 			}
 		})
@@ -731,7 +966,7 @@ func TestScratchBuilder(t *testing.T) {
 			want: FromStrings("ddd", "444"),
 		},
 	} {
-		t.Run(fmt.Sprint(i), func(t *testing.T) {
+		t.Run(strconv.Itoa(i), func(t *testing.T) {
 			b := NewScratchBuilder(len(tcase.add))
 			for _, lbl := range tcase.add {
 				b.Add(lbl.Name, lbl.Value)
@@ -753,6 +988,98 @@ func TestLabels_Hash(t *testing.T) {
 
 var benchmarkLabelsResult uint64
 
+func TestLabels_HashForLabels(t *testing.T) {
+	lbls1 := FromStrings("__name__", "http_requests_total", "a", "1", "b", "2", "c", "3")
+	lbls2 := FromStrings("__name__", "different_metric", "a", "1", "b", "999", "c", "3")
+
+	h1, b1 := lbls1.HashForLabels(nil, "a", "c")
+	h2, b2 := lbls1.HashForLabels(nil, "a", "c")
+	require.Equal(t, h1, h2)
+	require.Equal(t, b1, b2)
+
+	// The Hash only depends on requested labels ("a" and "c").
+	// lbls2 has a different __name__ and a different "b", but identical "a" and "c".
+	h3, b3 := lbls2.HashForLabels(nil, "a", "c")
+	require.Equal(t, h1, h3)
+	require.Equal(t, b1, b3)
+
+	// Changing a selected label must change the hash
+	lbls3 := FromStrings("__name__", "http_requests_total", "a", "999", "b", "2", "c", "3")
+	h4, _ := lbls3.HashForLabels(nil, "a", "c")
+	require.NotEqual(t, h1, h4)
+
+	// Interleaving missing names before ("0"), between ("bb"), and after ("z") matches
+	// tests skipping missing names and covers the names[j] < ls[i].Name branch.
+	hInterleaved, _ := lbls1.HashForLabels(nil, "0", "a", "bb", "c", "z")
+	require.Equal(t, h1, hInterleaved)
+
+	// Requesting non-existent label names should not panic, return empty buffer,
+	// and match empty labels hash.
+	h5, b5 := lbls1.HashForLabels(nil, "nonexistent", "z")
+	require.Empty(t, b5)
+
+	h6, _ := lbls2.HashForLabels(nil, "nonexistent", "z")
+	require.Equal(t, h5, h6)
+
+	hEmpty, _ := EmptyLabels().HashForLabels(nil)
+	require.Equal(t, hEmpty, h5)
+
+	// Buffer reuse test: pre-fill buf with stale/dirty bytes to ensure
+	// b = b[:0] truncates without reallocation, hash matches h1, and underlying memory is reused.
+	buf := make([]byte, 10, 64)
+	copy(buf, "stalebytes")
+	hBuf, returnedBuf := lbls1.HashForLabels(buf, "a", "c")
+	require.Equal(t, h1, hBuf)
+	require.Same(t, &buf[0], &returnedBuf[0])
+}
+
+func TestLabels_HashWithoutLabels(t *testing.T) {
+	lbls1 := FromStrings("__name__", "http_requests_total", "a", "1", "b", "2", "c", "3")
+	lbls2 := FromStrings("__name__", "other_metric_name", "a", "1", "b", "999", "c", "3")
+
+	h1, b1 := lbls1.HashWithoutLabels(nil, "b")
+	h2, b2 := lbls1.HashWithoutLabels(nil, "b")
+	require.Equal(t, h1, h2)
+	require.Equal(t, b1, b2)
+
+	// HashWithoutLabels excluding "b" leaves "a" and "c", so it must match HashForLabels with "a" and "c".
+	hForAC, _ := lbls1.HashForLabels(nil, "a", "c")
+	require.Equal(t, h1, hForAC)
+
+	// Explicitly including MetricName in names should have no effect since __name__ is excluded by default.
+	hMetricName, _ := lbls1.HashWithoutLabels(nil, MetricName, "b")
+	require.Equal(t, h1, hMetricName)
+
+	// Non-existent excluded names before ("0") and after ("z") retained names.
+	hNonExistent, _ := lbls1.HashWithoutLabels(nil, "0", "b", "z")
+	require.Equal(t, h1, hNonExistent)
+
+	// HashWithoutLabels excludes "b" AND always excludes "__name__".
+	// lbls2 has different __name__ and different "b", but identical "a" and "c".
+	h3, b3 := lbls2.HashWithoutLabels(nil, "b")
+	require.Equal(t, h1, h3)
+	require.Equal(t, b1, b3)
+
+	// Changing a retained label must change the hash
+	lbls3 := FromStrings("__name__", "http_requests_total", "a", "999", "b", "2", "c", "3")
+	h4, _ := lbls3.HashWithoutLabels(nil, "b")
+	require.NotEqual(t, h1, h4)
+
+	// Excluding everything leaves empty labels (excluding __name__ by default)
+	h5, b5 := lbls1.HashWithoutLabels(nil, "a", "b", "c")
+	require.Empty(t, b5)
+	hEmpty, _ := EmptyLabels().HashWithoutLabels(nil)
+	require.Equal(t, hEmpty, h5)
+
+	// Buffer reuse test: pre-fill buf with stale/dirty bytes to ensure
+	// b = b[:0] truncates without reallocation, hash matches h1, and underlying memory is reused.
+	buf := make([]byte, 10, 64)
+	copy(buf, "stalebytes")
+	hBuf, returnedBuf := lbls1.HashWithoutLabels(buf, "b")
+	require.Equal(t, h1, hBuf)
+	require.Same(t, &buf[0], &returnedBuf[0])
+}
+
 func BenchmarkLabels_Hash(b *testing.B) {
 	for _, tcase := range []struct {
 		name string
@@ -762,7 +1089,7 @@ func BenchmarkLabels_Hash(b *testing.B) {
 			name: "typical labels under 1KB",
 			lbls: func() Labels {
 				b := NewBuilder(EmptyLabels())
-				for i := 0; i < 10; i++ {
+				for i := range 10 {
 					// Label ~20B name, 50B value.
 					b.Set(fmt.Sprintf("abcdefghijabcdefghijabcdefghij%d", i), fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i))
 				}
@@ -773,7 +1100,7 @@ func BenchmarkLabels_Hash(b *testing.B) {
 			name: "bigger labels over 1KB",
 			lbls: func() Labels {
 				b := NewBuilder(EmptyLabels())
-				for i := 0; i < 10; i++ {
+				for i := range 10 {
 					// Label ~50B name, 50B value.
 					b.Set(fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i), fmt.Sprintf("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghij%d", i))
 				}
@@ -798,7 +1125,7 @@ func BenchmarkLabels_Hash(b *testing.B) {
 
 			b.ReportAllocs()
 			b.ResetTimer()
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				h = tcase.lbls.Hash()
 			}
 			benchmarkLabelsResult = h
@@ -810,7 +1137,7 @@ var benchmarkLabels = []Label{
 	{"job", "node"},
 	{"instance", "123.123.1.211:9090"},
 	{"path", "/api/v1/namespaces/<namespace>/deployments/<name>"},
-	{"method", "GET"},
+	{"method", http.MethodGet},
 	{"namespace", "system"},
 	{"status", "500"},
 	{"prometheus", "prometheus-core-1"},
@@ -821,7 +1148,7 @@ var benchmarkLabels = []Label{
 func BenchmarkBuilder(b *testing.B) {
 	var l Labels
 	builder := NewBuilder(EmptyLabels())
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		builder.Reset(EmptyLabels())
 		for _, l := range benchmarkLabels {
 			builder.Set(l.Name, l.Value)
@@ -832,9 +1159,9 @@ func BenchmarkBuilder(b *testing.B) {
 }
 
 func BenchmarkLabels_Copy(b *testing.B) {
-	l := New(benchmarkLabels...)
+	l := NewForBenchmark(benchmarkLabels...)
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		l = l.Copy()
 	}
 }
@@ -844,7 +1171,7 @@ func TestMarshaling(t *testing.T) {
 	expectedJSON := "{\"aaa\":\"111\",\"bbb\":\"2222\",\"ccc\":\"33333\"}"
 	b, err := json.Marshal(lbls)
 	require.NoError(t, err)
-	require.Equal(t, expectedJSON, string(b))
+	require.JSONEq(t, expectedJSON, string(b))
 
 	var gotJ Labels
 	err = json.Unmarshal(b, &gotJ)
@@ -854,7 +1181,7 @@ func TestMarshaling(t *testing.T) {
 	expectedYAML := "aaa: \"111\"\nbbb: \"2222\"\nccc: \"33333\"\n"
 	b, err = yaml.Marshal(lbls)
 	require.NoError(t, err)
-	require.Equal(t, expectedYAML, string(b))
+	require.YAMLEq(t, expectedYAML, string(b))
 
 	var gotY Labels
 	err = yaml.Unmarshal(b, &gotY)
@@ -870,7 +1197,7 @@ func TestMarshaling(t *testing.T) {
 	b, err = json.Marshal(f)
 	require.NoError(t, err)
 	expectedJSONFromStruct := "{\"a_labels\":" + expectedJSON + "}"
-	require.Equal(t, expectedJSONFromStruct, string(b))
+	require.JSONEq(t, expectedJSONFromStruct, string(b))
 
 	var gotFJ foo
 	err = json.Unmarshal(b, &gotFJ)
@@ -880,7 +1207,7 @@ func TestMarshaling(t *testing.T) {
 	b, err = yaml.Marshal(f)
 	require.NoError(t, err)
 	expectedYAMLFromStruct := "a_labels:\n  aaa: \"111\"\n  bbb: \"2222\"\n  ccc: \"33333\"\n"
-	require.Equal(t, expectedYAMLFromStruct, string(b))
+	require.YAMLEq(t, expectedYAMLFromStruct, string(b))
 
 	var gotFY foo
 	err = yaml.Unmarshal(b, &gotFY)

@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,8 +14,8 @@
 package chunks
 
 import (
-	"bufio"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/crc32"
@@ -25,7 +25,6 @@ import (
 	"strconv"
 
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 )
 
@@ -77,28 +76,22 @@ func (p HeadChunkRef) Unpack() (HeadSeriesRef, HeadChunkID) {
 }
 
 // HeadChunkID refers to a specific chunk in a series (memSeries) in the Head.
-// Each memSeries has its own monotonically increasing number to refer to its chunks.
-// If the HeadChunkID value is...
-//   - memSeries.firstChunkID+len(memSeries.mmappedChunks), it's the head chunk.
-//   - less than the above, but >= memSeries.firstID, then it's
-//     memSeries.mmappedChunks[i] where i = HeadChunkID - memSeries.firstID.
+// Each memSeries has its own IDs for in-order and out-of-order chunks.
+//
+// IDs occupy bits 0-22 of HeadChunkRef (bit 23 is the OOO flag) and wrap modulo
+// 2^23 (see wrapChunkID, headChunkID, and oooHeadChunkID in tsdb/head_read.go).
+// They are not a globally monotonic counter: never order them, compare them, or
+// bound-check them directly. Recover the live-chunk index with
+//
+//	i = wrapChunkID(HeadChunkID - firstChunkID)
+//
+// For in-order chunks, i indexes mmappedChunks, then the headChunks linked list.
 //
 // If memSeries.headChunks is non-nil it points to a *memChunk that holds the current
-// "open" (accepting appends) instance. *memChunk is a linked list and memChunk.next pointer
-// might link to the older *memChunk instance.
+// "open" (accepting appends) instance. *memChunk is a linked list and memChunk.prev
+// pointer might link to the older *memChunk instance.
 // If there are multiple *memChunk instances linked to each other from memSeries.headChunks
-// they will be m-mapped as soon as possible leaving only "open" *memChunk instance.
-//
-// Example:
-// assume a memSeries.firstChunkID=7 and memSeries.mmappedChunks=[p5,p6,p7,p8,p9].
-//
-//	| HeadChunkID value | refers to ...                                                                          |
-//	|-------------------|----------------------------------------------------------------------------------------|
-//	|               0-6 | chunks that have been compacted to blocks, these won't return data for queries in Head |
-//	|              7-11 | memSeries.mmappedChunks[i] where i is 0 to 4.                                          |
-//	|                12 |                                                         *memChunk{next: nil}
-//	|                13 |                                         *memChunk{next: ^}
-//	|                14 | memSeries.headChunks -> *memChunk{next: ^}
+// they will be m-mapped as soon as possible leaving only one "open" *memChunk instance.
 type HeadChunkID uint64
 
 // BlockChunkRef refers to a chunk within a persisted block.
@@ -133,18 +126,12 @@ type Meta struct {
 	// Time range the data covers.
 	// When MaxTime == math.MaxInt64 the chunk is still open and being appended to.
 	MinTime, MaxTime int64
-
-	// OOOLastRef, OOOLastMinTime and OOOLastMaxTime are kept as markers for
-	// overlapping chunks.
-	// These fields point to the last created out of order Chunk (the head) that existed
-	// when Series() was called and was overlapping.
-	// Series() and Chunk() method responses should be consistent for the same
-	// query even if new data is added in between the calls.
-	OOOLastRef                     ChunkRef
-	OOOLastMinTime, OOOLastMaxTime int64
 }
 
 // ChunkFromSamples requires all samples to have the same type.
+// It is not efficient and meant for testing purposes only.
+// It scans the samples to determine whether any sample has ST set and
+// creates a chunk accordingly.
 func ChunkFromSamples(s []Sample) (Meta, error) {
 	return ChunkFromSamplesGeneric(SampleSlice(s))
 }
@@ -163,33 +150,46 @@ func ChunkFromSamplesGeneric(s Samples) (Meta, error) {
 	}
 
 	sampleType := s.Get(0).Type()
-	c, err := chunkenc.NewEmptyChunk(sampleType.ChunkEncoding())
+
+	hasST := false
+	for i := range s.Len() {
+		if s.Get(i).ST() != 0 {
+			hasST = true
+			break
+		}
+	}
+
+	// Request storing ST in the chunk if available.
+	c, err := sampleType.NewChunk(hasST, hasST)
 	if err != nil {
 		return Meta{}, err
 	}
 
-	ca, _ := c.Appender()
+	ca, err := c.Appender()
+	if err != nil {
+		return emptyChunk, fmt.Errorf("failed to create chunk appender: %w", err)
+	}
 	var newChunk chunkenc.Chunk
 
 	for i := 0; i < s.Len(); i++ {
 		switch sampleType {
 		case chunkenc.ValFloat:
-			ca.Append(s.Get(i).T(), s.Get(i).F())
+			ca.Append(s.Get(i).ST(), s.Get(i).T(), s.Get(i).F())
 		case chunkenc.ValHistogram:
-			newChunk, _, ca, err = ca.AppendHistogram(nil, s.Get(i).T(), s.Get(i).H(), false)
+			newChunk, _, ca, err = ca.AppendHistogram(nil, s.Get(i).ST(), s.Get(i).T(), s.Get(i).H(), false)
 			if err != nil {
 				return emptyChunk, err
 			}
 			if newChunk != nil {
-				return emptyChunk, fmt.Errorf("did not expect to start a second chunk")
+				return emptyChunk, errors.New("did not expect to start a second chunk")
 			}
 		case chunkenc.ValFloatHistogram:
-			newChunk, _, ca, err = ca.AppendFloatHistogram(nil, s.Get(i).T(), s.Get(i).FH(), false)
+			newChunk, _, ca, err = ca.AppendFloatHistogram(nil, s.Get(i).ST(), s.Get(i).T(), s.Get(i).FH(), false)
 			if err != nil {
 				return emptyChunk, err
 			}
 			if newChunk != nil {
-				return emptyChunk, fmt.Errorf("did not expect to start a second chunk")
+				return emptyChunk, errors.New("did not expect to start a second chunk")
 			}
 		default:
 			panic(fmt.Sprintf("unknown sample type %s", sampleType.String()))
@@ -206,7 +206,7 @@ func ChunkFromSamplesGeneric(s Samples) (Meta, error) {
 // Used in tests to compare the content of chunks.
 func ChunkMetasToSamples(chunks []Meta) (result []Sample) {
 	if len(chunks) == 0 {
-		return
+		return result
 	}
 
 	for _, chunk := range chunks {
@@ -227,13 +227,13 @@ func ChunkMetasToSamples(chunks []Meta) (result []Sample) {
 			}
 		}
 	}
-	return
+	return result
 }
 
 // Iterator iterates over the chunks of a single time series.
 type Iterator interface {
 	// At returns the current meta.
-	// It depends on implementation if the chunk is populated or not.
+	// It depends on the implementation whether the chunk is populated or not.
 	At() Meta
 	// Next advances the iterator by one.
 	Next() bool
@@ -259,7 +259,7 @@ func (cm *Meta) OverlapsClosedInterval(mint, maxt int64) bool {
 	return cm.MinTime <= maxt && mint <= cm.MaxTime
 }
 
-var errInvalidSize = fmt.Errorf("invalid size")
+var errInvalidSize = errors.New("invalid size")
 
 var castagnoliTable *crc32.Table
 
@@ -289,12 +289,13 @@ func checkCRC32(data, sum []byte) error {
 type Writer struct {
 	dirFile *os.File
 	files   []*os.File
-	wbuf    *bufio.Writer
+	wbuf    fileutil.BufWriter
 	n       int64
 	crc32   hash.Hash
 	buf     [binary.MaxVarintLen32]byte
 
-	segmentSize int64
+	segmentSize   int64
+	useUncachedIO bool
 }
 
 const (
@@ -302,21 +303,40 @@ const (
 	DefaultChunkSegmentSize = 512 * 1024 * 1024
 )
 
-// NewWriterWithSegSize returns a new writer against the given directory
-// and allows setting a custom size for the segments.
-func NewWriterWithSegSize(dir string, segmentSize int64) (*Writer, error) {
-	return newWriter(dir, segmentSize)
+type writerOptions struct {
+	segmentSize   int64
+	useUncachedIO bool
 }
 
-// NewWriter returns a new writer against the given directory
-// using the default segment size.
-func NewWriter(dir string) (*Writer, error) {
-	return newWriter(dir, DefaultChunkSegmentSize)
+type WriterOption func(*writerOptions)
+
+func WithUncachedIO(enabled bool) WriterOption {
+	return func(o *writerOptions) {
+		o.useUncachedIO = enabled
+	}
 }
 
-func newWriter(dir string, segmentSize int64) (*Writer, error) {
-	if segmentSize <= 0 {
-		segmentSize = DefaultChunkSegmentSize
+// WithSegmentSize sets the chunk segment size for the writer.
+// Passing a value less than or equal to 0 causes the default segment size (DefaultChunkSegmentSize) to be used.
+func WithSegmentSize(segmentSize int64) WriterOption {
+	return func(o *writerOptions) {
+		if segmentSize <= 0 {
+			segmentSize = DefaultChunkSegmentSize
+		}
+
+		o.segmentSize = segmentSize
+	}
+}
+
+// NewWriter returns a new writer against the given directory.
+// It uses DefaultChunkSegmentSize as the default segment size.
+func NewWriter(dir string, opts ...WriterOption) (*Writer, error) {
+	options := &writerOptions{
+		segmentSize: DefaultChunkSegmentSize,
+	}
+
+	for _, opt := range opts {
+		opt(options)
 	}
 
 	if err := os.MkdirAll(dir, 0o777); err != nil {
@@ -327,10 +347,11 @@ func newWriter(dir string, segmentSize int64) (*Writer, error) {
 		return nil, err
 	}
 	return &Writer{
-		dirFile:     dirFile,
-		n:           0,
-		crc32:       newCRC32(),
-		segmentSize: segmentSize,
+		dirFile:       dirFile,
+		n:             0,
+		crc32:         newCRC32(),
+		segmentSize:   options.segmentSize,
+		useUncachedIO: options.useUncachedIO,
 	}, nil
 }
 
@@ -341,7 +362,7 @@ func (w *Writer) tail() *os.File {
 	return w.files[len(w.files)-1]
 }
 
-// finalizeTail writes all pending data to the current tail file,
+// finalizeTail writes all pending data to the current tail file if any,
 // truncates its size, and closes it.
 func (w *Writer) finalizeTail() error {
 	tf := w.tail()
@@ -349,8 +370,10 @@ func (w *Writer) finalizeTail() error {
 		return nil
 	}
 
-	if err := w.wbuf.Flush(); err != nil {
-		return err
+	if w.wbuf != nil {
+		if err := w.wbuf.Flush(); err != nil {
+			return err
+		}
 	}
 	if err := tf.Sync(); err != nil {
 		return err
@@ -381,33 +404,58 @@ func (w *Writer) cut() error {
 
 	w.files = append(w.files, f)
 	if w.wbuf != nil {
-		w.wbuf.Reset(f)
+		if err := w.wbuf.Reset(f); err != nil {
+			return err
+		}
 	} else {
-		w.wbuf = bufio.NewWriterSize(f, 8*1024*1024)
+		var (
+			wbuf fileutil.BufWriter
+			err  error
+		)
+		size := 8 * 1024 * 1024
+		if w.useUncachedIO {
+			// Uncached IO is implemented using direct I/O for now.
+			wbuf, err = fileutil.NewDirectIOWriter(f, size)
+		} else {
+			wbuf, err = fileutil.NewBufioWriterWithSize(f, size)
+		}
+		if err != nil {
+			return err
+		}
+		w.wbuf = wbuf
 	}
 
 	return nil
 }
 
+// cutSegmentFile creates the next segment file in dirFile and writes its header.
+// It does not fsync the file content, so a crash may leave the file with missing or invalid content.
+// Callers must account for this.
 func cutSegmentFile(dirFile *os.File, magicNumber uint32, chunksFormat byte, allocSize int64) (headerSize int, newFile *os.File, seq int, returnErr error) {
-	p, seq, err := nextSequenceFile(dirFile.Name())
+	_, seq, err := nextSequenceFile(dirFile.Name())
 	if err != nil {
 		return 0, nil, 0, fmt.Errorf("next sequence file: %w", err)
 	}
-	ptmp := p + ".tmp"
-	f, err := os.OpenFile(ptmp, os.O_WRONLY|os.O_CREATE, 0o666)
+	return cutSegmentFileWithSeq(dirFile, magicNumber, chunksFormat, allocSize, seq)
+}
+
+// cutSegmentFileWithSeq is like cutSegmentFile but uses the given sequence
+// instead of deriving it from the files currently on disk. It lets the head
+// chunk disk mapper keep numbering monotonic across truncation.
+func cutSegmentFileWithSeq(dirFile *os.File, magicNumber uint32, chunksFormat byte, allocSize int64, seq int) (headerSize int, newFile *os.File, seqOut int, returnErr error) {
+	p := segmentFile(dirFile.Name(), seq)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE, 0o666)
 	if err != nil {
-		return 0, nil, 0, fmt.Errorf("open temp file: %w", err)
+		return 0, nil, 0, fmt.Errorf("open segment file: %w", err)
 	}
 	defer func() {
 		if returnErr != nil {
-			errs := tsdb_errors.NewMulti(returnErr)
+			errs := []error{returnErr}
 			if f != nil {
-				errs.Add(f.Close())
+				errs = append(errs, f.Close())
 			}
-			// Calling RemoveAll on a non-existent file does not return error.
-			errs.Add(os.RemoveAll(ptmp))
-			returnErr = errs.Err()
+			errs = append(errs, os.RemoveAll(p))
+			returnErr = errors.Join(errs...)
 		}
 	}()
 	if allocSize > 0 {
@@ -419,7 +467,7 @@ func cutSegmentFile(dirFile *os.File, magicNumber uint32, chunksFormat byte, all
 		return 0, nil, 0, fmt.Errorf("sync directory: %w", err)
 	}
 
-	// Write header metadata for new file.
+	// Write header metadata.
 	metab := make([]byte, SegmentHeaderSize)
 	binary.BigEndian.PutUint32(metab[:MagicChunksSize], magicNumber)
 	metab[4] = chunksFormat
@@ -427,23 +475,6 @@ func cutSegmentFile(dirFile *os.File, magicNumber uint32, chunksFormat byte, all
 	n, err := f.Write(metab)
 	if err != nil {
 		return 0, nil, 0, fmt.Errorf("write header: %w", err)
-	}
-	if err := f.Close(); err != nil {
-		return 0, nil, 0, fmt.Errorf("close temp file: %w", err)
-	}
-	f = nil
-
-	if err := fileutil.Rename(ptmp, p); err != nil {
-		return 0, nil, 0, fmt.Errorf("replace file: %w", err)
-	}
-
-	f, err = os.OpenFile(p, os.O_WRONLY, 0o666)
-	if err != nil {
-		return 0, nil, 0, fmt.Errorf("open final file: %w", err)
-	}
-	// Skip header for further writes.
-	if _, err := f.Seek(int64(n), 0); err != nil {
-		return 0, nil, 0, fmt.Errorf("seek in final file: %w", err)
 	}
 	return n, f, seq, nil
 }
@@ -478,7 +509,7 @@ func (w *Writer) WriteChunks(chks ...Meta) error {
 		// the batch is too large to fit in the current segment.
 		cutNewBatch := (i != 0) && (batchSize+SegmentHeaderSize > w.segmentSize)
 
-		// When the segment already has some data than
+		// If the segment already has some data then
 		// the first batch size calculation should account for that.
 		if firstBatch && w.n > SegmentHeaderSize {
 			cutNewBatch = batchSize+w.n > w.segmentSize
@@ -634,10 +665,10 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 	for _, fn := range files {
 		f, err := fileutil.OpenMmapFile(fn)
 		if err != nil {
-			return nil, tsdb_errors.NewMulti(
+			return nil, errors.Join(
 				fmt.Errorf("mmap files: %w", err),
-				tsdb_errors.CloseAll(cs),
-			).Err()
+				closeAll(cs),
+			)
 		}
 		cs = append(cs, f)
 		bs = append(bs, realByteSlice(f.Bytes()))
@@ -645,16 +676,16 @@ func NewDirReader(dir string, pool chunkenc.Pool) (*Reader, error) {
 
 	reader, err := newReader(bs, cs, pool)
 	if err != nil {
-		return nil, tsdb_errors.NewMulti(
+		return nil, errors.Join(
 			err,
-			tsdb_errors.CloseAll(cs),
-		).Err()
+			closeAll(cs),
+		)
 	}
 	return reader, nil
 }
 
 func (s *Reader) Close() error {
-	return tsdb_errors.CloseAll(s.cs)
+	return closeAll(s.cs)
 }
 
 // Size returns the size of the chunks.
@@ -717,7 +748,7 @@ func nextSequenceFile(dir string) (string, int, error) {
 		}
 		// It is not necessary that we find the files in number order,
 		// for example with '1000000' and '200000', '1000000' would come first.
-		// Though this is a very very race case, we check anyway for the max id.
+		// Though this is a very very rare case, we check anyway for the max id.
 		if j > i {
 			i = j
 		}
@@ -742,4 +773,24 @@ func sequenceFiles(dir string) ([]string, error) {
 		res = append(res, filepath.Join(dir, fi.Name()))
 	}
 	return res, nil
+}
+
+// closeAll closes all given closers while recording all errors.
+func closeAll(cs []io.Closer) error {
+	var errs []error
+	for _, c := range cs {
+		errs = append(errs, c.Close())
+	}
+	return errors.Join(errs...)
+}
+
+// EncodedSizeInBytes calculates the total size in bytes of a given chunk,
+// when encoded by the chunks.Writer.
+// It requires a bytes buffer of at least MaxChunkLengthFieldSize size to avoid allocations.
+func EncodedSizeInBytes(chunk chunkenc.Chunk, buf []byte) int64 {
+	size := int64(len(chunk.Bytes()))                   // The chunk data itself.
+	size += int64(binary.PutUvarint(buf, uint64(size))) // The data length is a variable length field.
+	size += ChunkEncodingSize                           // The chunk encoding.
+	size += crc32.Size                                  // The 4 bytes of crc32.
+	return size
 }

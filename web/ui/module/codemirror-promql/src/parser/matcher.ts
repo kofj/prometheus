@@ -12,33 +12,77 @@
 // limitations under the License.
 
 import { SyntaxNode } from '@lezer/common';
-import { EqlRegex, EqlSingle, LabelName, MatchOp, Neq, NeqRegex, StringLiteral } from '@prometheus-io/lezer-promql';
+import {
+  EqlRegex,
+  EqlSingle,
+  LabelName,
+  MatchOp,
+  Neq,
+  NeqRegex,
+  StringLiteral,
+  UnquotedLabelMatcher,
+  QuotedLabelMatcher,
+  QuotedLabelName,
+} from '@prometheus-io/lezer-promql';
 import { EditorState } from '@codemirror/state';
 import { Matcher } from '../types';
 
 function createMatcher(labelMatcher: SyntaxNode, state: EditorState): Matcher {
   const matcher = new Matcher(0, '', '');
   const cursor = labelMatcher.cursor();
-  if (!cursor.next()) {
-    // weird case, that would mean the labelMatcher doesn't have any child.
-    return matcher;
-  }
-  do {
-    switch (cursor.type.id) {
-      case LabelName:
-        matcher.name = state.sliceDoc(cursor.from, cursor.to);
-        break;
-      case MatchOp:
-        const ope = cursor.node.firstChild;
-        if (ope) {
-          matcher.type = ope.type.id;
+  switch (cursor.type.id) {
+    case QuotedLabelMatcher:
+      if (!cursor.next()) {
+        // weird case, that would mean the QuotedLabelMatcher doesn't have any child.
+        return matcher;
+      }
+      do {
+        switch (cursor.type.id) {
+          case QuotedLabelName:
+            matcher.name = state.sliceDoc(cursor.from, cursor.to).slice(1, -1);
+            break;
+          case MatchOp: {
+            const ope = cursor.node.firstChild;
+            if (ope) {
+              matcher.type = ope.type.id;
+            }
+            break;
+          }
+          case StringLiteral:
+            matcher.value = state.sliceDoc(cursor.from, cursor.to).slice(1, -1);
+            break;
         }
-        break;
-      case StringLiteral:
-        matcher.value = state.sliceDoc(cursor.from, cursor.to).slice(1, -1);
-        break;
-    }
-  } while (cursor.nextSibling());
+      } while (cursor.nextSibling());
+      break;
+    case UnquotedLabelMatcher:
+      if (!cursor.next()) {
+        // weird case, that would mean the UnquotedLabelMatcher doesn't have any child.
+        return matcher;
+      }
+      do {
+        switch (cursor.type.id) {
+          case LabelName:
+            matcher.name = state.sliceDoc(cursor.from, cursor.to);
+            break;
+          case MatchOp: {
+            const ope = cursor.node.firstChild;
+            if (ope) {
+              matcher.type = ope.type.id;
+            }
+            break;
+          }
+          case StringLiteral:
+            matcher.value = state.sliceDoc(cursor.from, cursor.to).slice(1, -1);
+            break;
+        }
+      } while (cursor.nextSibling());
+      break;
+    case QuotedLabelName:
+      matcher.name = '__name__';
+      matcher.value = state.sliceDoc(cursor.from, cursor.to).slice(1, -1);
+      matcher.type = EqlSingle;
+      break;
+  }
   return matcher;
 }
 
@@ -60,7 +104,7 @@ export function labelMatchersToString(metricName: string, matchers?: Matcher[], 
     if (matcher.name === labelName || matcher.value === '') {
       continue;
     }
-    let type = '';
+    let type: string;
     switch (matcher.type) {
       case EqlSingle:
         type = '=';

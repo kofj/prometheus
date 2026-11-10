@@ -1,4 +1,4 @@
-// Copyright 2021 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,10 +22,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
 
 	"github.com/prometheus/prometheus/discovery"
@@ -49,6 +49,7 @@ func mockServer(t *testing.T) *httptest.Server {
 }
 
 func TestPuppetSlashInURL(t *testing.T) {
+	t.Parallel()
 	tests := map[string]string{
 		"https://puppetserver":      "https://puppetserver/pdb/query/v4",
 		"https://puppetserver/":     "https://puppetserver/pdb/query/v4",
@@ -70,7 +71,11 @@ func TestPuppetSlashInURL(t *testing.T) {
 		metrics := cfg.NewDiscovererMetrics(reg, refreshMetrics)
 		require.NoError(t, metrics.Register())
 
-		d, err := NewDiscovery(&cfg, log.NewNopLogger(), metrics)
+		d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{
+			Logger:  promslog.NewNopLogger(),
+			Metrics: metrics,
+			SetName: "puppetdb",
+		})
 		require.NoError(t, err)
 		require.Equal(t, apiURL, d.url)
 
@@ -79,6 +84,7 @@ func TestPuppetSlashInURL(t *testing.T) {
 }
 
 func TestPuppetDBRefresh(t *testing.T) {
+	t.Parallel()
 	ts := mockServer(t)
 
 	cfg := SDConfig{
@@ -94,7 +100,11 @@ func TestPuppetDBRefresh(t *testing.T) {
 	metrics := cfg.NewDiscovererMetrics(reg, refreshMetrics)
 	require.NoError(t, metrics.Register())
 
-	d, err := NewDiscovery(&cfg, log.NewNopLogger(), metrics)
+	d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{
+		Logger:  promslog.NewNopLogger(),
+		Metrics: metrics,
+		SetName: "puppetdb",
+	})
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -126,6 +136,7 @@ func TestPuppetDBRefresh(t *testing.T) {
 }
 
 func TestPuppetDBRefreshWithParameters(t *testing.T) {
+	t.Parallel()
 	ts := mockServer(t)
 
 	cfg := SDConfig{
@@ -142,7 +153,11 @@ func TestPuppetDBRefreshWithParameters(t *testing.T) {
 	metrics := cfg.NewDiscovererMetrics(reg, refreshMetrics)
 	require.NoError(t, metrics.Register())
 
-	d, err := NewDiscovery(&cfg, log.NewNopLogger(), metrics)
+	d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{
+		Logger:  promslog.NewNopLogger(),
+		Metrics: metrics,
+		SetName: "puppetdb",
+	})
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -184,7 +199,8 @@ func TestPuppetDBRefreshWithParameters(t *testing.T) {
 }
 
 func TestPuppetDBInvalidCode(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 	}))
 
@@ -201,7 +217,11 @@ func TestPuppetDBInvalidCode(t *testing.T) {
 	metrics := cfg.NewDiscovererMetrics(reg, refreshMetrics)
 	require.NoError(t, metrics.Register())
 
-	d, err := NewDiscovery(&cfg, log.NewNopLogger(), metrics)
+	d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{
+		Logger:  promslog.NewNopLogger(),
+		Metrics: metrics,
+		SetName: "puppetdb",
+	})
 	require.NoError(t, err)
 
 	ctx := context.Background()
@@ -212,7 +232,8 @@ func TestPuppetDBInvalidCode(t *testing.T) {
 }
 
 func TestPuppetDBInvalidFormat(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	t.Parallel()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprintln(w, "{}")
 	}))
 
@@ -229,7 +250,11 @@ func TestPuppetDBInvalidFormat(t *testing.T) {
 	metrics := cfg.NewDiscovererMetrics(reg, refreshMetrics)
 	require.NoError(t, metrics.Register())
 
-	d, err := NewDiscovery(&cfg, log.NewNopLogger(), metrics)
+	d, err := NewDiscovery(&cfg, discovery.DiscovererOptions{
+		Logger:  promslog.NewNopLogger(),
+		Metrics: metrics,
+		SetName: "puppetdb",
+	})
 	require.NoError(t, err)
 
 	ctx := context.Background()

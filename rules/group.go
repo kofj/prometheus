@@ -1,4 +1,4 @@
-// Copyright 2013 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,46 +16,48 @@ package rules
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"maps"
 	"math"
 	"slices"
 	"strings"
 	"sync"
 	"time"
 
-	"go.uber.org/atomic"
-
-	"github.com/prometheus/prometheus/promql/parser"
-
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
+	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/schema"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
 // Group is a set of rules that have a logical relation.
 type Group struct {
-	name                 string
-	file                 string
-	interval             time.Duration
-	limit                int
-	rules                []Rule
-	seriesInPreviousEval []map[string]labels.Labels // One per Rule.
-	staleSeries          []labels.Labels
-	opts                 *ManagerOptions
-	mtx                  sync.Mutex
-	evaluationTime       time.Duration
-	lastEvaluation       time.Time // Wall-clock time of most recent evaluation.
-	lastEvalTimestamp    time.Time // Time slot used for most recent evaluation.
+	name                  string
+	file                  string
+	interval              time.Duration
+	queryOffset           *time.Duration
+	limit                 int
+	rules                 []Rule
+	seriesInPreviousEval  []map[string]labels.Labels // One per Rule.
+	staleSeries           []labels.Labels
+	opts                  *ManagerOptions
+	mtx                   sync.Mutex
+	evaluationTime        time.Duration // Time it took to evaluate the group.
+	evaluationRuleTimeSum time.Duration // Sum of time it took to evaluate each rule in the group.
+	lastEvaluation        time.Time     // Wall-clock time of most recent evaluation.
+	lastEvalTimestamp     time.Time     // Time slot used for most recent evaluation.
 
 	shouldRestore bool
 
@@ -64,7 +66,7 @@ type Group struct {
 	terminated  chan struct{}
 	managerDone chan struct{}
 
-	logger log.Logger
+	logger *slog.Logger
 
 	metrics *Metrics
 
@@ -72,8 +74,7 @@ type Group struct {
 	// defaults to DefaultEvalIterationFunc.
 	evalIterationFunc GroupEvalIterationFunc
 
-	// concurrencyController controls the rules evaluation concurrency.
-	concurrencyController RuleConcurrencyController
+	appOpts storage.AOptions
 }
 
 // GroupEvalIterationFunc is used to implement and extend rule group
@@ -90,15 +91,20 @@ type GroupOptions struct {
 	Rules             []Rule
 	ShouldRestore     bool
 	Opts              *ManagerOptions
+	QueryOffset       *time.Duration
 	done              chan struct{}
 	EvalIterationFunc GroupEvalIterationFunc
 }
 
 // NewGroup makes a new Group with the given name, options, and rules.
 func NewGroup(o GroupOptions) *Group {
-	metrics := o.Opts.Metrics
+	opts := o.Opts
+	if opts == nil {
+		opts = &ManagerOptions{}
+	}
+	metrics := opts.Metrics
 	if metrics == nil {
-		metrics = NewGroupMetrics(o.Opts.Registerer)
+		metrics = NewGroupMetrics(opts.Registerer)
 	}
 
 	key := GroupKey(o.File, o.Name)
@@ -108,6 +114,7 @@ func NewGroup(o GroupOptions) *Group {
 	metrics.EvalFailures.WithLabelValues(key)
 	metrics.GroupLastEvalTime.WithLabelValues(key)
 	metrics.GroupLastDuration.WithLabelValues(key)
+	metrics.GroupLastRuleDurationSum.WithLabelValues(key)
 	metrics.GroupRules.WithLabelValues(key).Set(float64(len(o.Rules)))
 	metrics.GroupSamples.WithLabelValues(key)
 	metrics.GroupInterval.WithLabelValues(key).Set(o.Interval.Seconds())
@@ -117,27 +124,27 @@ func NewGroup(o GroupOptions) *Group {
 		evalIterationFunc = DefaultEvalIterationFunc
 	}
 
-	concurrencyController := o.Opts.RuleConcurrencyController
-	if concurrencyController == nil {
-		concurrencyController = sequentialRuleEvalController{}
+	if opts.Logger == nil {
+		opts.Logger = promslog.NewNopLogger()
 	}
 
 	return &Group{
-		name:                  o.Name,
-		file:                  o.File,
-		interval:              o.Interval,
-		limit:                 o.Limit,
-		rules:                 o.Rules,
-		shouldRestore:         o.ShouldRestore,
-		opts:                  o.Opts,
-		seriesInPreviousEval:  make([]map[string]labels.Labels, len(o.Rules)),
-		done:                  make(chan struct{}),
-		managerDone:           o.done,
-		terminated:            make(chan struct{}),
-		logger:                log.With(o.Opts.Logger, "file", o.File, "group", o.Name),
-		metrics:               metrics,
-		evalIterationFunc:     evalIterationFunc,
-		concurrencyController: concurrencyController,
+		name:                 o.Name,
+		file:                 o.File,
+		interval:             o.Interval,
+		queryOffset:          o.QueryOffset,
+		limit:                o.Limit,
+		rules:                o.Rules,
+		shouldRestore:        o.ShouldRestore,
+		opts:                 opts,
+		seriesInPreviousEval: make([]map[string]labels.Labels, len(o.Rules)),
+		done:                 make(chan struct{}),
+		managerDone:          o.done,
+		terminated:           make(chan struct{}),
+		logger:               opts.Logger.With("file", o.File, "group", o.Name),
+		metrics:              metrics,
+		evalIterationFunc:    evalIterationFunc,
+		appOpts:              storage.AOptions{RejectOutOfOrder: true},
 	}
 }
 
@@ -148,9 +155,44 @@ func (g *Group) Name() string { return g.name }
 func (g *Group) File() string { return g.file }
 
 // Rules returns the group's rules.
-func (g *Group) Rules() []Rule { return g.rules }
+func (g *Group) Rules(matcherSets ...[]*labels.Matcher) []Rule {
+	if len(matcherSets) == 0 {
+		return g.rules
+	}
+	var rules []Rule
+	for _, rule := range g.rules {
+		if matchesMatcherSets(matcherSets, rule.Labels()) {
+			rules = append(rules, rule)
+		}
+	}
+	return rules
+}
 
-// Queryable returns the group's querable.
+func matches(lbls labels.Labels, matchers ...*labels.Matcher) bool {
+	for _, m := range matchers {
+		if v := lbls.Get(m.Name); !m.Matches(v) {
+			return false
+		}
+	}
+	return true
+}
+
+// matchesMatcherSets ensures all matches in each matcher set are ANDed and the set of those is ORed.
+func matchesMatcherSets(matcherSets [][]*labels.Matcher, lbls labels.Labels) bool {
+	if len(matcherSets) == 0 {
+		return true
+	}
+
+	var ok bool
+	for _, matchers := range matcherSets {
+		if matches(lbls, matchers...) {
+			ok = true
+		}
+	}
+	return ok
+}
+
+// Queryable returns the group's queryable.
 func (g *Group) Queryable() storage.Queryable { return g.opts.Queryable }
 
 // Context returns the group's context.
@@ -162,7 +204,7 @@ func (g *Group) Interval() time.Duration { return g.interval }
 // Limit returns the group's limit.
 func (g *Group) Limit() int { return g.limit }
 
-func (g *Group) Logger() log.Logger { return g.logger }
+func (g *Group) Logger() *slog.Logger { return g.logger }
 
 func (g *Group) run(ctx context.Context) {
 	defer close(g.terminated)
@@ -175,7 +217,7 @@ func (g *Group) run(ctx context.Context) {
 		return
 	}
 
-	ctx = promql.NewOriginContext(ctx, map[string]interface{}{
+	ctx = promql.NewOriginContext(ctx, map[string]any{
 		"ruleGroup": map[string]string{
 			"file": g.File(),
 			"name": g.Name(),
@@ -231,7 +273,6 @@ func (g *Group) run(ctx context.Context) {
 		}
 
 		g.RestoreForState(time.Now())
-		g.shouldRestore = false
 	}
 
 	for {
@@ -256,9 +297,17 @@ func (g *Group) run(ctx context.Context) {
 	}
 }
 
-func (g *Group) stop() {
+func (g *Group) stopAsync() {
 	close(g.done)
+}
+
+func (g *Group) waitStopped() {
 	<-g.terminated
+}
+
+func (g *Group) stop() {
+	g.stopAsync()
+	g.waitStopped()
 }
 
 func (g *Group) hash() uint64 {
@@ -316,6 +365,28 @@ func (g *Group) setEvaluationTime(dur time.Duration) {
 	g.mtx.Lock()
 	defer g.mtx.Unlock()
 	g.evaluationTime = dur
+}
+
+// GetRuleEvaluationTimeSum returns the sum of the time it took to evaluate each rule in the group irrespective of concurrency.
+func (g *Group) GetRuleEvaluationTimeSum() time.Duration {
+	g.mtx.Lock()
+	defer g.mtx.Unlock()
+	return g.evaluationRuleTimeSum
+}
+
+// updateRuleEvaluationTimeSum updates evaluationRuleTimeSum which is the sum of the time it took to evaluate each rule in the group irrespective of concurrency.
+// It collects the times from the rules themselves.
+func (g *Group) updateRuleEvaluationTimeSum() {
+	var sum time.Duration
+	for _, rule := range g.rules {
+		sum += rule.GetEvaluationDuration()
+	}
+
+	g.metrics.GroupLastRuleDurationSum.WithLabelValues(GroupKey(g.file, g.name)).Set(sum.Seconds())
+
+	g.mtx.Lock()
+	defer g.mtx.Unlock()
+	g.evaluationRuleTimeSum = sum
 }
 
 // GetLastEvaluation returns the time the last evaluation of the rule group took place.
@@ -413,9 +484,7 @@ func (g *Group) CopyState(from *Group) {
 			continue
 		}
 
-		for fp, a := range far.active {
-			ar.active[fp] = a
-		}
+		maps.Copy(ar.active, far.active)
 	}
 
 	// Handle deleted and unmatched duplicate rules.
@@ -435,176 +504,248 @@ func (g *Group) CopyState(from *Group) {
 // Rules can be evaluated concurrently if the `concurrent-rule-eval` feature flag is enabled.
 func (g *Group) Eval(ctx context.Context, ts time.Time) {
 	var (
-		samplesTotal atomic.Float64
-		wg           sync.WaitGroup
+		samplesTotal    atomic.Float64
+		ruleQueryOffset = g.QueryOffset()
 	)
-
-	for i, rule := range g.rules {
-		select {
-		case <-g.done:
-			return
-		default:
+	eval := func(i int, rule Rule, cleanup func()) {
+		if cleanup != nil {
+			defer cleanup()
 		}
 
-		eval := func(i int, rule Rule, cleanup func()) {
-			if cleanup != nil {
-				defer cleanup()
+		logger := g.logger.With("name", rule.Name(), "index", i)
+		ctx, sp := otel.Tracer("").Start(ctx, "rule")
+		sp.SetAttributes(
+			attribute.String("group", g.Name()),
+			attribute.String("name", rule.Name()),
+			attribute.Stringer("query_offset", ruleQueryOffset),
+			attribute.Int("index", i),
+		)
+		defer func(t time.Time) {
+			sp.End()
+
+			since := time.Since(t)
+			g.metrics.EvalDuration.Observe(since.Seconds())
+			g.metrics.EvalDurationHistogram.Observe(since.Seconds())
+			rule.SetEvaluationDuration(since)
+			rule.SetEvaluationTimestamp(t)
+		}(time.Now())
+
+		if sp.SpanContext().IsSampled() && sp.SpanContext().HasTraceID() {
+			logger = logger.With("trace_id", sp.SpanContext().TraceID())
+		}
+
+		g.metrics.EvalTotal.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+
+		vector, err := rule.Eval(ctx, ruleQueryOffset, ts, g.opts.QueryFunc, g.opts.ExternalURL, g.Limit())
+		if err != nil {
+			rule.SetHealth(HealthBad)
+			rule.SetLastError(err)
+			sp.SetStatus(codes.Error, err.Error())
+			g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+
+			// Canceled queries are intentional termination of queries. This normally
+			// happens on shutdown and thus we skip logging of any errors here.
+			if _, ok := errors.AsType[promql.ErrQueryCanceled](err); !ok {
+				logger.Warn("Evaluating rule failed", "rule", rule, "err", err)
 			}
-
-			logger := log.WithPrefix(g.logger, "name", rule.Name(), "index", i)
-			ctx, sp := otel.Tracer("").Start(ctx, "rule")
-			sp.SetAttributes(attribute.String("name", rule.Name()))
-			defer func(t time.Time) {
-				sp.End()
-
-				since := time.Since(t)
-				g.metrics.EvalDuration.Observe(since.Seconds())
-				rule.SetEvaluationDuration(since)
-				rule.SetEvaluationTimestamp(t)
-			}(time.Now())
-
-			if sp.SpanContext().IsSampled() && sp.SpanContext().HasTraceID() {
-				logger = log.WithPrefix(logger, "trace_id", sp.SpanContext().TraceID())
+			return
+		}
+		meta := rule.Metadata()
+		appOpts := g.appOpts
+		if g.opts.AppendMetadata && !meta.IsEmpty() {
+			appOpts.Metadata = meta
+		}
+		if g.opts.EnableTypeAndUnitLabels && len(vector) > 0 {
+			sm := schema.Metadata{Type: meta.Type, Unit: meta.Unit}
+			if !sm.IsTypeEmpty() || sm.Unit != "" {
+				lb := labels.NewBuilder(labels.EmptyLabels())
+				for idx := range vector {
+					lb.Reset(vector[idx].Metric)
+					sm.Name = vector[idx].Metric.Get(labels.MetricName)
+					sm.SetToLabels(lb)
+					vector[idx].Metric = lb.Labels()
+				}
 			}
+		}
+		rule.SetHealth(HealthGood)
+		rule.SetLastError(nil)
+		samplesTotal.Add(float64(len(vector)))
+		sp.SetAttributes(attribute.Int("num_series", len(vector)))
 
-			g.metrics.EvalTotal.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+		if ar, ok := rule.(*AlertingRule); ok {
+			ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
+		}
+		var (
+			numOutOfOrder = 0
+			numTooOld     = 0
+			numDuplicates = 0
+		)
 
-			vector, err := rule.Eval(ctx, ts, g.opts.QueryFunc, g.opts.ExternalURL, g.Limit())
+		// The appender can block on storage and for simple queries it can
+		// be the majority of trace duration. Trace it using dedicated span
+		// so it's clear from the trace where did all the duration go.
+		_, appenderSp := otel.Tracer("").Start(ctx, "newAppender")
+		app := g.opts.AppendableV2.AppenderV2(ctx)
+		appenderSp.End()
+		seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
+		defer func() {
+			_, commitSp := otel.Tracer("").Start(ctx, "ruleCommit")
+			err := app.Commit()
+			if err != nil {
+				commitSp.RecordError(err)
+				commitSp.SetStatus(codes.Error, err.Error())
+			}
+			commitSp.End()
 			if err != nil {
 				rule.SetHealth(HealthBad)
 				rule.SetLastError(err)
 				sp.SetStatus(codes.Error, err.Error())
 				g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
 
-				// Canceled queries are intentional termination of queries. This normally
-				// happens on shutdown and thus we skip logging of any errors here.
-				var eqc promql.ErrQueryCanceled
-				if !errors.As(err, &eqc) {
-					level.Warn(logger).Log("msg", "Evaluating rule failed", "rule", rule, "err", err)
-				}
+				logger.Warn("Rule sample appending failed", "err", err)
 				return
 			}
-			rule.SetHealth(HealthGood)
-			rule.SetLastError(nil)
-			samplesTotal.Add(float64(len(vector)))
+			g.seriesInPreviousEval[i] = seriesReturned
+		}()
 
-			if ar, ok := rule.(*AlertingRule); ok {
-				ar.sendAlerts(ctx, ts, g.opts.ResendDelay, g.interval, g.opts.NotifyFunc)
-			}
-			var (
-				numOutOfOrder = 0
-				numTooOld     = 0
-				numDuplicates = 0
-			)
+		// Trace the time to write the evaluation result samples into the
+		// appender. This span ends before the commit span starts.
+		_, appendSp := otel.Tracer("").Start(ctx, "ruleAppendResults")
+		defer appendSp.End()
 
-			app := g.opts.Appendable.Appender(ctx)
-			seriesReturned := make(map[string]labels.Labels, len(g.seriesInPreviousEval[i]))
-			defer func() {
-				if err := app.Commit(); err != nil {
-					rule.SetHealth(HealthBad)
-					rule.SetLastError(err)
-					sp.SetStatus(codes.Error, err.Error())
-					g.metrics.EvalFailures.WithLabelValues(GroupKey(g.File(), g.Name())).Inc()
+		for _, s := range vector {
+			_, err = app.Append(0, s.Metric, 0, s.T, s.F, nil, s.H, appOpts)
 
-					level.Warn(logger).Log("msg", "Rule sample appending failed", "err", err)
-					return
+			if err != nil {
+				rule.SetHealth(HealthBad)
+				rule.SetLastError(err)
+				sp.SetStatus(codes.Error, err.Error())
+				unwrappedErr := errors.Unwrap(err)
+				if unwrappedErr == nil {
+					unwrappedErr = err
 				}
-				g.seriesInPreviousEval[i] = seriesReturned
-			}()
-
-			for _, s := range vector {
-				if s.H != nil {
-					_, err = app.AppendHistogram(0, s.Metric, s.T, nil, s.H)
-				} else {
-					_, err = app.Append(0, s.Metric, s.T, s.F)
+				switch {
+				case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample):
+					numOutOfOrder++
+					logger.Debug("Rule evaluation result discarded", "err", err, "sample", s)
+				case errors.Is(unwrappedErr, storage.ErrTooOldSample):
+					numTooOld++
+					logger.Debug("Rule evaluation result discarded", "err", err, "sample", s)
+				case errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
+					numDuplicates++
+					logger.Debug("Rule evaluation result discarded", "err", err, "sample", s)
+				default:
+					logger.Warn("Rule evaluation result discarded", "err", err, "sample", s)
 				}
-
-				if err != nil {
-					rule.SetHealth(HealthBad)
-					rule.SetLastError(err)
-					sp.SetStatus(codes.Error, err.Error())
-					unwrappedErr := errors.Unwrap(err)
-					if unwrappedErr == nil {
-						unwrappedErr = err
-					}
-					switch {
-					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample):
-						numOutOfOrder++
-						level.Debug(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
-					case errors.Is(unwrappedErr, storage.ErrTooOldSample):
-						numTooOld++
-						level.Debug(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
-					case errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
-						numDuplicates++
-						level.Debug(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
-					default:
-						level.Warn(logger).Log("msg", "Rule evaluation result discarded", "err", err, "sample", s)
-					}
-				} else {
-					buf := [1024]byte{}
-					seriesReturned[string(s.Metric.Bytes(buf[:]))] = s.Metric
-				}
-			}
-			if numOutOfOrder > 0 {
-				level.Warn(logger).Log("msg", "Error on ingesting out-of-order result from rule evaluation", "num_dropped", numOutOfOrder)
-			}
-			if numTooOld > 0 {
-				level.Warn(logger).Log("msg", "Error on ingesting too old result from rule evaluation", "num_dropped", numTooOld)
-			}
-			if numDuplicates > 0 {
-				level.Warn(logger).Log("msg", "Error on ingesting results from rule evaluation with different value but same timestamp", "num_dropped", numDuplicates)
-			}
-
-			for metric, lset := range g.seriesInPreviousEval[i] {
-				if _, ok := seriesReturned[metric]; !ok {
-					// Series no longer exposed, mark it stale.
-					_, err = app.Append(0, lset, timestamp.FromTime(ts), math.Float64frombits(value.StaleNaN))
-					unwrappedErr := errors.Unwrap(err)
-					if unwrappedErr == nil {
-						unwrappedErr = err
-					}
-					switch {
-					case unwrappedErr == nil:
-					case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample),
-						errors.Is(unwrappedErr, storage.ErrTooOldSample),
-						errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
-						// Do not count these in logging, as this is expected if series
-						// is exposed from a different rule.
-					default:
-						level.Warn(logger).Log("msg", "Adding stale sample failed", "sample", lset.String(), "err", err)
-					}
-				}
+			} else {
+				buf := [1024]byte{}
+				seriesReturned[string(s.Metric.Bytes(buf[:]))] = s.Metric
 			}
 		}
+		if numOutOfOrder > 0 {
+			logger.Warn("Error on ingesting out-of-order result from rule evaluation", "num_dropped", numOutOfOrder)
+		}
+		if numTooOld > 0 {
+			logger.Warn("Error on ingesting too old result from rule evaluation", "num_dropped", numTooOld)
+		}
+		if numDuplicates > 0 {
+			logger.Warn("Error on ingesting results from rule evaluation with different value but same timestamp", "num_dropped", numDuplicates)
+		}
 
-		// If the rule has no dependencies, it can run concurrently because no other rules in this group depend on its output.
-		// Try run concurrently if there are slots available.
-		if ctrl := g.concurrencyController; isRuleEligibleForConcurrentExecution(rule) && ctrl.Allow() {
-			wg.Add(1)
-
-			go eval(i, rule, func() {
-				wg.Done()
-				ctrl.Done()
-			})
-		} else {
-			eval(i, rule, nil)
+		for metric, lset := range g.seriesInPreviousEval[i] {
+			if _, ok := seriesReturned[metric]; !ok {
+				// Series no longer exposed, mark it stale.
+				_, err = app.Append(0, lset, 0, timestamp.FromTime(ts.Add(-ruleQueryOffset)), math.Float64frombits(value.StaleNaN), nil, nil, appOpts)
+				unwrappedErr := errors.Unwrap(err)
+				if unwrappedErr == nil {
+					unwrappedErr = err
+				}
+				switch {
+				case unwrappedErr == nil:
+				case errors.Is(unwrappedErr, storage.ErrOutOfOrderSample),
+					errors.Is(unwrappedErr, storage.ErrTooOldSample),
+					errors.Is(unwrappedErr, storage.ErrDuplicateSampleForTimestamp):
+					// Do not count these in logging, as this is expected if series
+					// is exposed from a different rule.
+				default:
+					logger.Warn("Adding stale sample failed", "sample", lset.String(), "err", err)
+				}
+			}
 		}
 	}
 
-	wg.Wait()
+	var wg sync.WaitGroup
+	ctrl := g.opts.RuleConcurrencyController
+	if ctrl == nil {
+		ctrl = sequentialRuleEvalController{}
+	}
+
+	batches := ctrl.SplitGroupIntoBatches(ctx, g)
+	if len(batches) == 0 {
+		// Sequential evaluation when batches aren't set.
+		// This is the behaviour without a defined RuleConcurrencyController
+		for i, rule := range g.rules {
+			// Check if the group has been stopped.
+			select {
+			case <-g.done:
+				return
+			default:
+			}
+			eval(i, rule, nil)
+		}
+	} else {
+		// Concurrent evaluation.
+		for _, batch := range batches {
+			for _, ruleIndex := range batch {
+				// Check if the group has been stopped.
+				select {
+				case <-g.done:
+					wg.Wait()
+					return
+				default:
+				}
+				rule := g.rules[ruleIndex]
+				if len(batch) > 1 && ctrl.Allow(ctx, g, rule) {
+					wg.Add(1)
+
+					go eval(ruleIndex, rule, func() {
+						wg.Done()
+						ctrl.Done(ctx)
+					})
+				} else {
+					eval(ruleIndex, rule, nil)
+				}
+			}
+			// It is important that we finish processing any rules in this current batch - before we move into the next one.
+			wg.Wait()
+		}
+	}
 
 	g.metrics.GroupSamples.WithLabelValues(GroupKey(g.File(), g.Name())).Set(samplesTotal.Load())
 	g.cleanupStaleSeries(ctx, ts)
+}
+
+func (g *Group) QueryOffset() time.Duration {
+	if g.queryOffset != nil {
+		return *g.queryOffset
+	}
+
+	if g.opts.DefaultRuleQueryOffset != nil {
+		return g.opts.DefaultRuleQueryOffset()
+	}
+
+	return time.Duration(0)
 }
 
 func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 	if len(g.staleSeries) == 0 {
 		return
 	}
-	app := g.opts.Appendable.Appender(ctx)
+	app := g.opts.AppendableV2.AppenderV2(ctx)
+	queryOffset := g.QueryOffset()
 	for _, s := range g.staleSeries {
 		// Rule that produced series no longer configured, mark it stale.
-		_, err := app.Append(0, s, timestamp.FromTime(ts), math.Float64frombits(value.StaleNaN))
+		_, err := app.Append(0, s, 0, timestamp.FromTime(ts.Add(-queryOffset)), math.Float64frombits(value.StaleNaN), nil, nil, g.appOpts)
 		unwrappedErr := errors.Unwrap(err)
 		if unwrappedErr == nil {
 			unwrappedErr = err
@@ -617,11 +758,11 @@ func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 			// Do not count these in logging, as this is expected if series
 			// is exposed from a different rule.
 		default:
-			level.Warn(g.logger).Log("msg", "Adding stale sample for previous configuration failed", "sample", s, "err", err)
+			g.logger.Warn("Adding stale sample for previous configuration failed", "sample", s, "err", err)
 		}
 	}
 	if err := app.Commit(); err != nil {
-		level.Warn(g.logger).Log("msg", "Stale sample appending for previous configuration failed", "err", err)
+		g.logger.Warn("Stale sample appending for previous configuration failed", "err", err)
 	} else {
 		g.staleSeries = nil
 	}
@@ -630,18 +771,24 @@ func (g *Group) cleanupStaleSeries(ctx context.Context, ts time.Time) {
 // RestoreForState restores the 'for' state of the alerts
 // by looking up last ActiveAt from storage.
 func (g *Group) RestoreForState(ts time.Time) {
+	defer func() {
+		totalRestoreTimeSeconds := time.Since(ts).Seconds()
+		g.metrics.GroupLastRestoreDuration.WithLabelValues(GroupKey(g.file, g.name)).Set(totalRestoreTimeSeconds)
+		g.logger.Debug("'for' state restoration completed", "duration_seconds", totalRestoreTimeSeconds)
+		g.shouldRestore = false
+	}()
 	maxtMS := int64(model.TimeFromUnixNano(ts.UnixNano()))
 	// We allow restoration only if alerts were active before after certain time.
 	mint := ts.Add(-g.opts.OutageTolerance)
 	mintMS := int64(model.TimeFromUnixNano(mint.UnixNano()))
 	q, err := g.opts.Queryable.Querier(mintMS, maxtMS)
 	if err != nil {
-		level.Error(g.logger).Log("msg", "Failed to get Querier", "err", err)
+		g.logger.Error("Failed to get Querier", "err", err)
 		return
 	}
 	defer func() {
 		if err := q.Close(); err != nil {
-			level.Error(g.logger).Log("msg", "Failed to close Querier", "err", err)
+			g.logger.Error("Failed to close Querier", "err", err)
 		}
 	}()
 
@@ -652,10 +799,30 @@ func (g *Group) RestoreForState(ts time.Time) {
 		}
 
 		alertHoldDuration := alertRule.HoldDuration()
-		if alertHoldDuration < g.opts.ForGracePeriod {
-			// If alertHoldDuration is already less than grace period, we would not
-			// like to make it wait for `g.opts.ForGracePeriod` time before firing.
-			// Hence we skip restoration, which will make it wait for alertHoldDuration.
+
+		sset, err := alertRule.QueryForStateSeries(g.opts.Context, q)
+		if err != nil {
+			g.logger.Error(
+				"Failed to restore 'for' state",
+				labels.AlertName, alertRule.Name(),
+				"stage", "Select",
+				"err", err,
+			)
+			// Even if we failed to query the `ALERT_FOR_STATE` series, we currently have no way to retry the restore process.
+			// So the best we can do is mark the rule as restored and let it eventually fire.
+			alertRule.SetRestored(true)
+			continue
+		}
+
+		// While not technically the same number of series we expect, it's as good of an approximation as any.
+		seriesByLabels := make(map[string]storage.Series, alertRule.ActiveAlertsCount())
+		for sset.Next() {
+			seriesByLabels[sset.At().Labels().DropReserved(func(n string) bool { return n == labels.MetricName }).String()] = sset.At()
+		}
+
+		// No results for this alert rule.
+		if len(seriesByLabels) == 0 {
+			g.logger.Debug("No series found to restore the 'for' state of the alert rule", labels.AlertName, alertRule.Name())
 			alertRule.SetRestored(true)
 			continue
 		}
@@ -663,22 +830,10 @@ func (g *Group) RestoreForState(ts time.Time) {
 		alertRule.ForEachActiveAlert(func(a *Alert) {
 			var s storage.Series
 
-			s, err := alertRule.QueryforStateSeries(g.opts.Context, a, q)
-			if err != nil {
-				// Querier Warnings are ignored. We do not care unless we have an error.
-				level.Error(g.logger).Log(
-					"msg", "Failed to restore 'for' state",
-					labels.AlertName, alertRule.Name(),
-					"stage", "Select",
-					"err", err,
-				)
+			s, ok := seriesByLabels[a.Labels.String()]
+			if !ok {
 				return
 			}
-
-			if s == nil {
-				return
-			}
-
 			// Series found for the 'for' state.
 			var t int64
 			var v float64
@@ -687,7 +842,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 				t, v = it.At()
 			}
 			if it.Err() != nil {
-				level.Error(g.logger).Log("msg", "Failed to restore 'for' state",
+				g.logger.Error("Failed to restore 'for' state",
 					labels.AlertName, alertRule.Name(), "stage", "Iterator", "err", it.Err())
 				return
 			}
@@ -702,10 +857,12 @@ func (g *Group) RestoreForState(ts time.Time) {
 
 			switch {
 			case timeRemainingPending <= 0:
-				// It means that alert was firing when prometheus went down.
-				// In the next Eval, the state of this alert will be set back to
-				// firing again if it's still firing in that Eval.
-				// Nothing to be done in this case.
+				// The alert was firing before the outage. Retain ActiveAt so the
+				// next Eval can transition it to firing with its evaluation timestamp.
+			case alertHoldDuration < g.opts.ForGracePeriod:
+				// Pending alerts with a hold duration shorter than the grace period
+				// should restart their hold duration rather than wait for the grace period.
+				return
 			case timeRemainingPending < g.opts.ForGracePeriod:
 				// (new) restoredActiveAt = (ts + m.opts.ForGracePeriod) - alertHoldDuration
 				//                            /* new firing time */      /* moving back by hold duration */
@@ -729,7 +886,7 @@ func (g *Group) RestoreForState(ts time.Time) {
 			}
 
 			a.ActiveAt = restoredActiveAt
-			level.Debug(g.logger).Log("msg", "'for' state restored",
+			g.logger.Debug("'for' state restored",
 				labels.AlertName, alertRule.Name(), "restored_time", a.ActiveAt.Format(time.RFC850),
 				"labels", a.Labels.String())
 		})
@@ -756,6 +913,10 @@ func (g *Group) Equals(ng *Group) bool {
 		return false
 	}
 
+	if ((g.queryOffset == nil) != (ng.queryOffset == nil)) || (g.queryOffset != nil && ng.queryOffset != nil && *g.queryOffset != *ng.queryOffset) {
+		return false
+	}
+
 	if len(g.rules) != len(ng.rules) {
 		return false
 	}
@@ -779,17 +940,21 @@ const namespace = "prometheus"
 
 // Metrics for rule evaluation.
 type Metrics struct {
-	EvalDuration        prometheus.Summary
-	IterationDuration   prometheus.Summary
-	IterationsMissed    *prometheus.CounterVec
-	IterationsScheduled *prometheus.CounterVec
-	EvalTotal           *prometheus.CounterVec
-	EvalFailures        *prometheus.CounterVec
-	GroupInterval       *prometheus.GaugeVec
-	GroupLastEvalTime   *prometheus.GaugeVec
-	GroupLastDuration   *prometheus.GaugeVec
-	GroupRules          *prometheus.GaugeVec
-	GroupSamples        *prometheus.GaugeVec
+	EvalDuration               prometheus.Summary
+	EvalDurationHistogram      prometheus.Histogram
+	IterationDuration          prometheus.Summary
+	IterationDurationHistogram prometheus.Histogram
+	IterationsMissed           *prometheus.CounterVec
+	IterationsScheduled        *prometheus.CounterVec
+	EvalTotal                  *prometheus.CounterVec
+	EvalFailures               *prometheus.CounterVec
+	GroupInterval              *prometheus.GaugeVec
+	GroupLastEvalTime          *prometheus.GaugeVec
+	GroupLastDuration          *prometheus.GaugeVec
+	GroupLastRuleDurationSum   *prometheus.GaugeVec
+	GroupLastRestoreDuration   *prometheus.GaugeVec
+	GroupRules                 *prometheus.GaugeVec
+	GroupSamples               *prometheus.GaugeVec
 }
 
 // NewGroupMetrics creates a new instance of Metrics and registers it with the provided registerer,
@@ -802,12 +967,31 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 				Name:       "rule_evaluation_duration_seconds",
 				Help:       "The duration for a rule to execute.",
 				Objectives: map[float64]float64{0.5: 0.05, 0.9: 0.01, 0.99: 0.001},
-			}),
+			},
+		),
+		EvalDurationHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace:                       namespace,
+			Name:                            "rule_evaluation_duration_histogram_seconds",
+			Help:                            "The duration for a rule to execute.",
+			Buckets:                         []float64{.01, .1, 1, 10},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: 1 * time.Hour,
+		}),
 		IterationDuration: prometheus.NewSummary(prometheus.SummaryOpts{
 			Namespace:  namespace,
 			Name:       "rule_group_duration_seconds",
 			Help:       "The duration of rule group evaluations.",
 			Objectives: map[float64]float64{0.01: 0.001, 0.05: 0.005, 0.5: 0.05, 0.90: 0.01, 0.99: 0.001},
+		}),
+		IterationDurationHistogram: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Namespace:                       namespace,
+			Name:                            "rule_group_duration_histogram_seconds",
+			Help:                            "The duration of rule group evaluations.",
+			Buckets:                         []float64{.01, .1, 1, 10},
+			NativeHistogramBucketFactor:     1.1,
+			NativeHistogramMaxBucketNumber:  100,
+			NativeHistogramMinResetDuration: 1 * time.Hour,
 		}),
 		IterationsMissed: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -865,6 +1049,22 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 			},
 			[]string{"rule_group"},
 		),
+		GroupLastRuleDurationSum: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "rule_group_last_rule_duration_sum_seconds",
+				Help:      "The sum of time in seconds it took to evaluate each rule in the group regardless of concurrency. This should be higher than the group duration if rules are evaluated concurrently.",
+			},
+			[]string{"rule_group"},
+		),
+		GroupLastRestoreDuration: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Namespace: namespace,
+				Name:      "rule_group_last_restore_duration_seconds",
+				Help:      "The duration of the last alert rules alerts restoration using the `ALERTS_FOR_STATE` series.",
+			},
+			[]string{"rule_group"},
+		),
 		GroupRules: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
@@ -886,7 +1086,9 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 	if reg != nil {
 		reg.MustRegister(
 			m.EvalDuration,
+			m.EvalDurationHistogram,
 			m.IterationDuration,
+			m.IterationDurationHistogram,
 			m.IterationsMissed,
 			m.IterationsScheduled,
 			m.EvalTotal,
@@ -894,6 +1096,8 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 			m.GroupInterval,
 			m.GroupLastEvalTime,
 			m.GroupLastDuration,
+			m.GroupLastRuleDurationSum,
+			m.GroupLastRestoreDuration,
 			m.GroupRules,
 			m.GroupSamples,
 		)
@@ -907,27 +1111,25 @@ func NewGroupMetrics(reg prometheus.Registerer) *Metrics {
 // output metric produced by another rule in its expression (i.e. as its "input").
 type dependencyMap map[Rule][]Rule
 
-// dependents returns the count of rules which use the output of the given rule as one of their inputs.
-func (m dependencyMap) dependents(r Rule) int {
-	return len(m[r])
+// dependents returns the rules which use the output of the given rule as one of their inputs.
+func (m dependencyMap) dependents(r Rule) []Rule {
+	return m[r]
 }
 
-// dependencies returns the count of rules on which the given rule is dependent for input.
-func (m dependencyMap) dependencies(r Rule) int {
+// dependencies returns the rules on which the given rule is dependent for input.
+func (m dependencyMap) dependencies(r Rule) []Rule {
 	if len(m) == 0 {
-		return 0
+		return []Rule{}
 	}
 
-	var count int
-	for _, children := range m {
-		for _, child := range children {
-			if child == r {
-				count++
-			}
+	var dependencies []Rule
+	for rule, dependents := range m {
+		if slices.Contains(dependents, r) {
+			dependencies = append(dependencies, rule)
 		}
 	}
 
-	return count
+	return dependencies
 }
 
 // isIndependent determines whether the given rule is not dependent on another rule for its input, nor is any other rule
@@ -937,18 +1139,17 @@ func (m dependencyMap) isIndependent(r Rule) bool {
 		return false
 	}
 
-	return m.dependents(r)+m.dependencies(r) == 0
+	return len(m.dependents(r)) == 0 && len(m.dependencies(r)) == 0
 }
 
 // buildDependencyMap builds a data-structure which contains the relationships between rules within a group.
 //
-// Alert rules, by definition, cannot have any dependents - but they can have dependencies. Any recording rule on whose
-// output an Alert rule depends will not be able to run concurrently.
+// Both Alert and RecordingRule can have dependents and dependencies. Alert can have dependents if another rule,
+// with in the group, queries ALERTS or ALERTS_FOR_NAME metrics.
 //
 // There is a class of rule expressions which are considered "indeterminate", because either relationships cannot be
 // inferred, or concurrent evaluation of rules depending on these series would produce undefined/unexpected behaviour:
 //   - wildcard queriers like {cluster="prod1"} which would match every series with that label selector
-//   - any "meta" series (series produced by Prometheus itself) like ALERTS, ALERTS_FOR_STATE
 //
 // Rules which are independent can run concurrently with no side-effects.
 func buildDependencyMap(rules []Rule) dependencyMap {
@@ -959,9 +1160,6 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 		return dependencies
 	}
 
-	inputs := make(map[string][]Rule, len(rules))
-	outputs := make(map[string][]Rule, len(rules))
-
 	var indeterminate bool
 
 	for _, rule := range rules {
@@ -969,26 +1167,67 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 			break
 		}
 
-		name := rule.Name()
-		outputs[name] = append(outputs[name], rule)
-
-		parser.Inspect(rule.Query(), func(node parser.Node, path []parser.Node) error {
+		parser.Inspect(rule.Query(), func(node parser.Node, _ []parser.Node) error {
 			if n, ok := node.(*parser.VectorSelector); ok {
+				// Find the name matcher for the rule.
+				var nameMatcher *labels.Matcher
+				if n.Name != "" {
+					nameMatcher = labels.MustNewMatcher(labels.MatchEqual, model.MetricNameLabel, n.Name)
+				} else {
+					for _, m := range n.LabelMatchers {
+						if m.Name == model.MetricNameLabel {
+							nameMatcher = m
+							break
+						}
+					}
+				}
+
 				// A wildcard metric expression means we cannot reliably determine if this rule depends on any other,
 				// which means we cannot safely run any rules concurrently.
-				if n.Name == "" && len(n.LabelMatchers) > 0 {
+				if nameMatcher == nil {
 					indeterminate = true
 					return nil
 				}
 
-				// Rules which depend on "meta-metrics" like ALERTS and ALERTS_FOR_STATE will have undefined behaviour
-				// if they run concurrently.
-				if n.Name == alertMetricName || n.Name == alertForStateMetricName {
-					indeterminate = true
-					return nil
+				// Check if the vector selector is querying "meta-metrics" like ALERTS and ALERTS_FOR_STATE and, if so,
+				// find out the "alertname" label matcher (it could be missing).
+				nameMatchesAlerts := nameMatcher.Matches(alertMetricName) || nameMatcher.Matches(alertForStateMetricName)
+				var alertsNameMatcher *labels.Matcher
+				if nameMatchesAlerts {
+					for _, m := range n.LabelMatchers {
+						if m.Name == labels.AlertName {
+							alertsNameMatcher = m
+							break
+						}
+					}
 				}
 
-				inputs[n.Name] = append(inputs[n.Name], rule)
+				// Find the other rules that this rule depends on.
+				for _, other := range rules {
+					// Rules are defined in order in a rule group. Once we find our rule we can stop searching
+					// because next rules can't be considered dependencies of this rule by specification, given
+					// they are defined later in the group. The next rules can still query this rule, but they're
+					// just not strict dependencies to honor.
+					if other == rule {
+						break
+					}
+
+					otherName := other.Name()
+
+					// If this rule vector selector matches the other rule name, then it's a dependency.
+					if nameMatcher.Matches(otherName) {
+						dependencies[other] = append(dependencies[other], rule)
+						continue
+					}
+
+					// If this rule vector selector is querying the alerts meta-metrics and the other rule
+					// is an alerting rule, then we check if the "alertname" matches. If it does, then it's a dependency.
+					if _, otherIsAlertingRule := other.(*AlertingRule); nameMatchesAlerts && otherIsAlertingRule {
+						if alertsNameMatcher == nil || alertsNameMatcher.Matches(otherName) {
+							dependencies[other] = append(dependencies[other], rule)
+						}
+					}
+				}
 			}
 			return nil
 		})
@@ -998,17 +1237,5 @@ func buildDependencyMap(rules []Rule) dependencyMap {
 		return nil
 	}
 
-	for output, outRules := range outputs {
-		for _, outRule := range outRules {
-			if inRules, found := inputs[output]; found && len(inRules) > 0 {
-				dependencies[outRule] = append(dependencies[outRule], inRules...)
-			}
-		}
-	}
-
 	return dependencies
-}
-
-func isRuleEligibleForConcurrentExecution(rule Rule) bool {
-	return rule.NoDependentRules() && rule.NoDependencyRules()
 }

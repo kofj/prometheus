@@ -1,4 +1,4 @@
-// Copyright 2021 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,7 +14,6 @@
 package storage
 
 import (
-	"fmt"
 	"math"
 	"testing"
 
@@ -29,11 +28,11 @@ import (
 
 func TestListSeriesIterator(t *testing.T) {
 	it := NewListSeriesIterator(samples{
-		fSample{0, 0},
-		fSample{1, 1},
-		fSample{1, 1.5},
-		fSample{2, 2},
-		fSample{3, 3},
+		fSample{-10, 0, 0},
+		fSample{-9, 1, 1},
+		fSample{-8, 1, 1.5},
+		fSample{-7, 2, 2},
+		fSample{-6, 3, 3},
 	})
 
 	// Seek to the first sample with ts=1.
@@ -41,30 +40,35 @@ func TestListSeriesIterator(t *testing.T) {
 	ts, v := it.At()
 	require.Equal(t, int64(1), ts)
 	require.Equal(t, 1., v)
+	require.Equal(t, int64(-9), it.AtST())
 
 	// Seek one further, next sample still has ts=1.
 	require.Equal(t, chunkenc.ValFloat, it.Next())
 	ts, v = it.At()
 	require.Equal(t, int64(1), ts)
 	require.Equal(t, 1.5, v)
+	require.Equal(t, int64(-8), it.AtST())
 
 	// Seek again to 1 and make sure we stay where we are.
 	require.Equal(t, chunkenc.ValFloat, it.Seek(1))
 	ts, v = it.At()
 	require.Equal(t, int64(1), ts)
 	require.Equal(t, 1.5, v)
+	require.Equal(t, int64(-8), it.AtST())
 
 	// Another seek.
 	require.Equal(t, chunkenc.ValFloat, it.Seek(3))
 	ts, v = it.At()
 	require.Equal(t, int64(3), ts)
 	require.Equal(t, 3., v)
+	require.Equal(t, int64(-6), it.AtST())
 
 	// And we don't go back.
 	require.Equal(t, chunkenc.ValFloat, it.Seek(2))
 	ts, v = it.At()
 	require.Equal(t, int64(3), ts)
 	require.Equal(t, 3., v)
+	require.Equal(t, int64(-6), it.AtST())
 
 	// Seek beyond the end.
 	require.Equal(t, chunkenc.ValNone, it.Seek(5))
@@ -72,7 +76,7 @@ func TestListSeriesIterator(t *testing.T) {
 	require.Equal(t, chunkenc.ValNone, it.Seek(2))
 }
 
-// TestSeriesSetToChunkSet test the property of SeriesSet that says
+// TestChunkSeriesSetToSeriesSet test the property of SeriesSet that says
 // returned series should be iterable even after Next is called.
 func TestChunkSeriesSetToSeriesSet(t *testing.T) {
 	series := []struct {
@@ -113,7 +117,7 @@ func TestChunkSeriesSetToSeriesSet(t *testing.T) {
 	require.Len(t, ssSlice, 2)
 	var iter chunkenc.Iterator
 	for i, s := range ssSlice {
-		require.EqualValues(t, series[i].lbs, s.Labels())
+		require.Equal(t, series[i].lbs, s.Labels())
 		iter = s.Iterator(iter)
 		j := 0
 		for iter.Next() == chunkenc.ValFloat {
@@ -126,6 +130,7 @@ func TestChunkSeriesSetToSeriesSet(t *testing.T) {
 
 type histogramTest struct {
 	samples                     []chunks.Sample
+	expectedSamples             []chunks.Sample
 	expectedCounterResetHeaders []chunkenc.CounterResetHeader
 }
 
@@ -140,6 +145,32 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 			{Offset: 0, Length: 2},
 		},
 		PositiveBuckets: []int64{2, 1}, // Abs: 2, 3
+	}
+	// h1 but with an extra empty bucket at offset -10.
+	// This can happen if h1 is from a recoded chunk, where a later histogram had a bucket at offset -10.
+	h1ExtraBuckets := &histogram.Histogram{
+		Count:         7,
+		ZeroCount:     2,
+		ZeroThreshold: 0.001,
+		Sum:           100,
+		Schema:        0,
+		PositiveSpans: []histogram.Span{
+			{Offset: -10, Length: 1},
+			{Offset: 9, Length: 2},
+		},
+		PositiveBuckets: []int64{0, 2, 1}, // Abs: 0, 2, 3
+	}
+	h1Recoded := &histogram.Histogram{
+		Count:         7,
+		ZeroCount:     2,
+		ZeroThreshold: 0.001,
+		Sum:           100,
+		Schema:        0,
+		PositiveSpans: []histogram.Span{
+			{Offset: 0, Length: 2},
+			{Offset: 1, Length: 2},
+		},
+		PositiveBuckets: []int64{2, 1, -3, 0}, // Abs: 2, 3, 0, 0
 	}
 	// Appendable to h1.
 	h2 := &histogram.Histogram{
@@ -178,6 +209,32 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 			{Offset: 0, Length: 2},
 		},
 		PositiveBuckets: []float64{3, 1},
+	}
+	// fh1 but with an extra empty bucket at offset -10.
+	// This can happen if fh1 is from a recoded chunk, where a later histogram had a bucket at offset -10.
+	fh1ExtraBuckets := &histogram.FloatHistogram{
+		Count:         6,
+		ZeroCount:     2,
+		ZeroThreshold: 0.001,
+		Sum:           100,
+		Schema:        0,
+		PositiveSpans: []histogram.Span{
+			{Offset: -10, Length: 1},
+			{Offset: 9, Length: 2},
+		},
+		PositiveBuckets: []float64{0, 3, 1},
+	}
+	fh1Recoded := &histogram.FloatHistogram{
+		Count:         6,
+		ZeroCount:     2,
+		ZeroThreshold: 0.001,
+		Sum:           100,
+		Schema:        0,
+		PositiveSpans: []histogram.Span{
+			{Offset: 0, Length: 2},
+			{Offset: 1, Length: 2},
+		},
+		PositiveBuckets: []float64{3, 1, 0, 0},
 	}
 	// Appendable to fh1.
 	fh2 := &histogram.FloatHistogram{
@@ -219,6 +276,20 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 		},
 		PositiveBuckets: []int64{2, 1}, // Abs: 2, 3
 	}
+	// gh1 recoded to add extra empty buckets at end.
+	gh1Recoded := &histogram.Histogram{
+		CounterResetHint: histogram.GaugeType,
+		Count:            7,
+		ZeroCount:        2,
+		ZeroThreshold:    0.001,
+		Sum:              100,
+		Schema:           0,
+		PositiveSpans: []histogram.Span{
+			{Offset: 0, Length: 2},
+			{Offset: 1, Length: 2},
+		},
+		PositiveBuckets: []int64{2, 1, -3, 0}, // Abs: 2, 3, 0, 0
+	}
 	gh2 := &histogram.Histogram{
 		CounterResetHint: histogram.GaugeType,
 		Count:            12,
@@ -246,6 +317,20 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 		},
 		PositiveBuckets: []float64{3, 1},
 	}
+	// gfh1 recoded to add an extra empty buckets at end.
+	gfh1Recoded := &histogram.FloatHistogram{
+		CounterResetHint: histogram.GaugeType,
+		Count:            6,
+		ZeroCount:        2,
+		ZeroThreshold:    0.001,
+		Sum:              100,
+		Schema:           0,
+		PositiveSpans: []histogram.Span{
+			{Offset: 0, Length: 2},
+			{Offset: 1, Length: 2},
+		},
+		PositiveBuckets: []float64{3, 1, 0, 0},
+	}
 	gfh2 := &histogram.FloatHistogram{
 		CounterResetHint: histogram.GaugeType,
 		Count:            17,
@@ -272,6 +357,9 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 			samples: []chunks.Sample{
 				hSample{t: 1, h: h1},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: h1},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
 		},
 		"two histograms encoded to a single chunk": {
@@ -279,10 +367,18 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: h1},
 				hSample{t: 2, h: h2},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: h1Recoded},
+				hSample{t: 2, h: h2},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
 		},
 		"two histograms encoded to two chunks": {
 			samples: []chunks.Sample{
+				hSample{t: 1, h: h2},
+				hSample{t: 2, h: h1},
+			},
+			expectedSamples: []chunks.Sample{
 				hSample{t: 1, h: h2},
 				hSample{t: 2, h: h1},
 			},
@@ -293,10 +389,18 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: staleHistogram},
 				hSample{t: 2, h: h1},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: staleHistogram},
+				hSample{t: 2, h: h1},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset, chunkenc.UnknownCounterReset},
 		},
 		"histogram and reduction in bucket encoded to two chunks": {
 			samples: []chunks.Sample{
+				hSample{t: 1, h: h1},
+				hSample{t: 2, h: h2down},
+			},
+			expectedSamples: []chunks.Sample{
 				hSample{t: 1, h: h1},
 				hSample{t: 2, h: h2down},
 			},
@@ -307,6 +411,9 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 			samples: []chunks.Sample{
 				fhSample{t: 1, fh: fh1},
 			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
 		},
 		"two float histograms encoded to a single chunk": {
@@ -314,10 +421,18 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				fhSample{t: 1, fh: fh1},
 				fhSample{t: 2, fh: fh2},
 			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1Recoded},
+				fhSample{t: 2, fh: fh2},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
 		},
 		"two float histograms encoded to two chunks": {
 			samples: []chunks.Sample{
+				fhSample{t: 1, fh: fh2},
+				fhSample{t: 2, fh: fh1},
+			},
+			expectedSamples: []chunks.Sample{
 				fhSample{t: 1, fh: fh2},
 				fhSample{t: 2, fh: fh1},
 			},
@@ -328,10 +443,18 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				fhSample{t: 1, fh: staleFloatHistogram},
 				fhSample{t: 2, fh: fh1},
 			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: staleFloatHistogram},
+				fhSample{t: 2, fh: fh1},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset, chunkenc.UnknownCounterReset},
 		},
 		"float histogram and reduction in bucket encoded to two chunks": {
 			samples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1},
+				fhSample{t: 2, fh: fh2down},
+			},
+			expectedSamples: []chunks.Sample{
 				fhSample{t: 1, fh: fh1},
 				fhSample{t: 2, fh: fh2down},
 			},
@@ -343,10 +466,18 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: h1},
 				fhSample{t: 2, fh: fh2},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: h1},
+				fhSample{t: 2, fh: fh2},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset, chunkenc.UnknownCounterReset},
 		},
 		"float histogram and histogram encoded to two chunks": {
 			samples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1},
+				hSample{t: 2, h: h2},
+			},
+			expectedSamples: []chunks.Sample{
 				fhSample{t: 1, fh: fh1},
 				hSample{t: 2, h: h2},
 			},
@@ -357,10 +488,17 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: h1},
 				fhSample{t: 2, fh: staleFloatHistogram},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: h1},
+				fhSample{t: 2, fh: staleFloatHistogram},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset, chunkenc.UnknownCounterReset},
 		},
 		"single gauge histogram encoded to one chunk": {
 			samples: []chunks.Sample{
+				hSample{t: 1, h: gh1},
+			},
+			expectedSamples: []chunks.Sample{
 				hSample{t: 1, h: gh1},
 			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
@@ -370,6 +508,10 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: gh1},
 				hSample{t: 2, h: gh2},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: gh1Recoded},
+				hSample{t: 2, h: gh2},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
 		},
 		"two gauge histograms encoded to one chunk when counter decreases": {
@@ -377,10 +519,17 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				hSample{t: 1, h: gh2},
 				hSample{t: 2, h: gh1},
 			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: gh2},
+				hSample{t: 2, h: gh1Recoded},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
 		},
 		"single gauge float histogram encoded to one chunk": {
 			samples: []chunks.Sample{
+				fhSample{t: 1, fh: gfh1},
+			},
+			expectedSamples: []chunks.Sample{
 				fhSample{t: 1, fh: gfh1},
 			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
@@ -390,6 +539,10 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				fhSample{t: 1, fh: gfh1},
 				fhSample{t: 2, fh: gfh2},
 			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: gfh1Recoded},
+				fhSample{t: 2, fh: gfh2},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
 		},
 		"two float gauge histograms encoded to one chunk when counter decreases": {
@@ -397,18 +550,45 @@ func TestHistogramSeriesToChunks(t *testing.T) {
 				fhSample{t: 1, fh: gfh2},
 				fhSample{t: 2, fh: gfh1},
 			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: gfh2},
+				fhSample{t: 2, fh: gfh1Recoded},
+			},
 			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.GaugeType},
+		},
+		"histogram with extra empty bucket followed by histogram encodes to one chunk": {
+			samples: []chunks.Sample{
+				hSample{t: 1, h: h1ExtraBuckets},
+				hSample{t: 2, h: h1},
+			},
+			expectedSamples: []chunks.Sample{
+				hSample{t: 1, h: h1ExtraBuckets},
+				hSample{t: 2, h: h1ExtraBuckets}, // Recoded to add the missing buckets.
+			},
+			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
+		},
+		"float histogram with extra empty bucket followed by float histogram encodes to one chunk": {
+			samples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1ExtraBuckets},
+				fhSample{t: 2, fh: fh1},
+			},
+			expectedSamples: []chunks.Sample{
+				fhSample{t: 1, fh: fh1ExtraBuckets},
+				fhSample{t: 2, fh: fh1ExtraBuckets}, // Recoded to add the missing buckets.
+			},
+			expectedCounterResetHeaders: []chunkenc.CounterResetHeader{chunkenc.UnknownCounterReset},
 		},
 	}
 
 	for testName, test := range tests {
 		t.Run(testName, func(t *testing.T) {
-			testHistogramsSeriesToChunks(t, test)
+			t.Run("list", func(t *testing.T) { testHistogramsSeriesToChunks(t, test, false) })
+			t.Run("chunks", func(t *testing.T) { testHistogramsSeriesToChunks(t, test, true) })
 		})
 	}
 }
 
-func testHistogramsSeriesToChunks(t *testing.T, test histogramTest) {
+func testHistogramsSeriesToChunks(t *testing.T, test histogramTest, fromChunks bool) {
 	lbs := labels.FromStrings("__name__", "up", "instance", "localhost:8080")
 	copiedSamples := []chunks.Sample{}
 	for _, s := range test.samples {
@@ -421,52 +601,301 @@ func testHistogramsSeriesToChunks(t *testing.T, test histogramTest) {
 			t.Error("internal error, unexpected type")
 		}
 	}
-	series := NewListSeries(lbs, copiedSamples)
+	var series Series = NewListSeries(lbs, copiedSamples)
+	if fromChunks {
+		var parts []Series
+		for _, s := range copiedSamples {
+			chk, err := chunks.ChunkFromSamples([]chunks.Sample{s})
+			require.NoError(t, err)
+			parts = append(parts, newChunkToSeriesDecoder(lbs, chk))
+		}
+		series = ChainedSeriesMerge(parts...)
+	}
 	encoder := NewSeriesToChunkEncoder(series)
-	require.EqualValues(t, lbs, encoder.Labels())
+	require.Equal(t, lbs, encoder.Labels())
 
 	chks, err := ExpandChunks(encoder.Iterator(nil))
 	require.NoError(t, err)
-	require.Equal(t, len(test.expectedCounterResetHeaders), len(chks))
+	require.Len(t, chks, len(test.expectedCounterResetHeaders))
 
 	// Decode all encoded samples and assert they are equal to the original ones.
 	encodedSamples := chunks.ChunkMetasToSamples(chks)
-	require.Equal(t, len(test.samples), len(encodedSamples))
+	require.Len(t, encodedSamples, len(test.expectedSamples))
 
-	for i, s := range test.samples {
+	for i, s := range test.expectedSamples {
 		encodedSample := encodedSamples[i]
 		switch expectedSample := s.(type) {
 		case hSample:
-			require.Equal(t, chunkenc.ValHistogram, encodedSample.Type(), "expect histogram", fmt.Sprintf("at idx %d", i))
+			require.Equalf(t, chunkenc.ValHistogram, encodedSample.Type(), "expect histogram at idx %d", i)
 			h := encodedSample.H()
 			// Ignore counter reset if not gauge here, will check on chunk level.
 			if expectedSample.h.CounterResetHint != histogram.GaugeType {
 				h.CounterResetHint = histogram.UnknownCounterReset
 			}
 			if value.IsStaleNaN(expectedSample.h.Sum) {
-				require.True(t, value.IsStaleNaN(h.Sum), fmt.Sprintf("at idx %d", i))
+				require.Truef(t, value.IsStaleNaN(h.Sum), "at idx %d", i)
 				continue
 			}
-			require.Equal(t, *expectedSample.h, *h.Compact(0), fmt.Sprintf("at idx %d", i))
+			require.Equalf(t, *expectedSample.h, *h, "at idx %d", i)
 		case fhSample:
-			require.Equal(t, chunkenc.ValFloatHistogram, encodedSample.Type(), "expect float histogram", fmt.Sprintf("at idx %d", i))
+			require.Equalf(t, chunkenc.ValFloatHistogram, encodedSample.Type(), "expect float histogram at idx %d", i)
 			fh := encodedSample.FH()
 			// Ignore counter reset if not gauge here, will check on chunk level.
 			if expectedSample.fh.CounterResetHint != histogram.GaugeType {
 				fh.CounterResetHint = histogram.UnknownCounterReset
 			}
 			if value.IsStaleNaN(expectedSample.fh.Sum) {
-				require.True(t, value.IsStaleNaN(fh.Sum), fmt.Sprintf("at idx %d", i))
+				require.Truef(t, value.IsStaleNaN(fh.Sum), "at idx %d", i)
 				continue
 			}
-			require.Equal(t, *expectedSample.fh, *fh.Compact(0), fmt.Sprintf("at idx %d", i))
+			require.Equalf(t, *expectedSample.fh, *fh, "at idx %d", i)
 		default:
 			t.Error("internal error, unexpected type")
 		}
 	}
 
 	for i, expectedCounterResetHint := range test.expectedCounterResetHeaders {
-		require.Equal(t, expectedCounterResetHint, getCounterResetHint(chks[i]), fmt.Sprintf("chunk at index %d", i))
+		require.Equalf(t, expectedCounterResetHint, getCounterResetHint(chks[i]), "chunk at index %d", i)
+	}
+}
+
+func TestSeriesToChunkEncoderFloatEncoding(t *testing.T) {
+	lbs := labels.FromStrings("__name__", "up")
+
+	manyFloats := func(n int) []chunks.Sample {
+		s := make([]chunks.Sample, 0, n)
+		for i := range n {
+			s = append(s, fSample{0, int64(i), float64(i)})
+		}
+		return s
+	}
+
+	manyFloatsWithST := func(n int) []chunks.Sample {
+		s := make([]chunks.Sample, 0, n)
+		for i := range n {
+			s = append(s, fSample{int64(i*10 + 5), int64((i + 1) * 10), float64(i)})
+		}
+		return s
+	}
+
+	histogramSampleWithST := func(st, ts int64) hSample {
+		s := histogramSample(ts, uk)
+		s.st = st
+		return s
+	}
+	floatHistogramSampleWithST := func(st, ts int64) fhSample {
+		s := floatHistogramSample(ts, uk)
+		s.st = st
+		return s
+	}
+
+	floatsNoST := []chunks.Sample{fSample{0, 10, 1}, fSample{0, 20, 2}, fSample{0, 30, 3}}
+	floatsAllST := []chunks.Sample{fSample{5, 10, 1}, fSample{15, 20, 2}, fSample{25, 30, 3}}
+	floatsMixedST := []chunks.Sample{fSample{0, 10, 1}, fSample{0, 20, 2}, fSample{15, 30, 3}, fSample{0, 40, 4}}
+
+	type expectedChunk struct {
+		encoding chunkenc.Encoding
+		// samples are the expected samples after a round-trip through the chunk,
+		// i.e. with the start timestamp zeroed when the chunk cannot store it.
+		samples []chunks.Sample
+	}
+
+	tests := map[string]struct {
+		useDefaultConstructor bool
+		floatEncoding         chunkenc.Encoding
+		samples               []chunks.Sample
+		expected              []expectedChunk
+	}{
+		"default, no ST": {
+			useDefaultConstructor: true,
+			samples:               floatsNoST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, floatsNoST},
+			},
+		},
+		"default, all ST": {
+			useDefaultConstructor: true,
+			samples:               floatsAllST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, floatsAllST},
+			},
+		},
+		"default, mixed ST cuts XOR chunk on first ST only": {
+			useDefaultConstructor: true,
+			samples:               floatsMixedST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, floatsMixedST[:2]},
+				{chunkenc.EncXOR2, floatsMixedST[2:]},
+			},
+		},
+		"xor, no ST": {
+			floatEncoding: chunkenc.EncXOR,
+			samples:       floatsNoST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, floatsNoST},
+			},
+		},
+		"xor, all ST": {
+			floatEncoding: chunkenc.EncXOR,
+			samples:       floatsAllST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, floatsAllST},
+			},
+		},
+		"xor, mixed ST cuts XOR chunk on first ST only": {
+			floatEncoding: chunkenc.EncXOR,
+			samples:       floatsMixedST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, floatsMixedST[:2]},
+				{chunkenc.EncXOR2, floatsMixedST[2:]},
+			},
+		},
+		"xor2, no ST": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       floatsNoST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, floatsNoST},
+			},
+		},
+		"xor2, all ST": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       floatsAllST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, floatsAllST},
+			},
+		},
+		"xor2, mixed ST does not cut": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       floatsMixedST,
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, floatsMixedST},
+			},
+		},
+		"default, type flips cut": {
+			useDefaultConstructor: true,
+			samples:               []chunks.Sample{fSample{0, 10, 1}, histogramSample(20, uk), fSample{0, 30, 3}},
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, []chunks.Sample{fSample{0, 10, 1}}},
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(20, uk)}},
+				{chunkenc.EncXOR, []chunks.Sample{fSample{0, 30, 3}}},
+			},
+		},
+		"xor2, type flips cut": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       []chunks.Sample{fSample{0, 10, 1}, histogramSample(20, uk), fSample{0, 30, 3}},
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, []chunks.Sample{fSample{0, 10, 1}}},
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(20, uk)}},
+				{chunkenc.EncXOR2, []chunks.Sample{fSample{0, 30, 3}}},
+			},
+		},
+		"default, histogram ST flips cut": {
+			useDefaultConstructor: true,
+			samples:               []chunks.Sample{histogramSample(10, uk), histogramSampleWithST(15, 20), histogramSample(30, uk)},
+			expected: []expectedChunk{
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(10, uk)}},
+				{chunkenc.EncHistogramST, []chunks.Sample{histogramSampleWithST(15, 20)}},
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(30, uk)}},
+			},
+		},
+		"xor2, histogram ST flips cut": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       []chunks.Sample{histogramSample(10, uk), histogramSampleWithST(15, 20), histogramSample(30, uk)},
+			expected: []expectedChunk{
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(10, uk)}},
+				{chunkenc.EncHistogramST, []chunks.Sample{histogramSampleWithST(15, 20)}},
+				{chunkenc.EncHistogram, []chunks.Sample{histogramSample(30, uk)}},
+			},
+		},
+		"xor2, float histogram ST flips cut": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       []chunks.Sample{floatHistogramSample(10, uk), floatHistogramSampleWithST(15, 20), floatHistogramSample(30, uk)},
+			expected: []expectedChunk{
+				{chunkenc.EncFloatHistogram, []chunks.Sample{floatHistogramSample(10, uk)}},
+				{chunkenc.EncFloatHistogramST, []chunks.Sample{floatHistogramSampleWithST(15, 20)}},
+				{chunkenc.EncFloatHistogram, []chunks.Sample{floatHistogramSample(30, uk)}},
+			},
+		},
+		"default, 150 samples split at 120": {
+			useDefaultConstructor: true,
+			samples:               manyFloats(150),
+			expected: []expectedChunk{
+				{chunkenc.EncXOR, manyFloats(150)[:120]},
+				{chunkenc.EncXOR, manyFloats(150)[120:]},
+			},
+		},
+		"xor2, 150 samples split at 120": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       manyFloats(150),
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, manyFloats(150)[:120]},
+				{chunkenc.EncXOR2, manyFloats(150)[120:]},
+			},
+		},
+		"default, 150 samples all ST split at 120": {
+			useDefaultConstructor: true,
+			samples:               manyFloatsWithST(150),
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, manyFloatsWithST(150)[:120]},
+				{chunkenc.EncXOR2, manyFloatsWithST(150)[120:]},
+			},
+		},
+		"xor2, 150 samples all ST split at 120": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples:       manyFloatsWithST(150),
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, manyFloatsWithST(150)[:120]},
+				{chunkenc.EncXOR2, manyFloatsWithST(150)[120:]},
+			},
+		},
+		"xor2, ST appearing on the last sample before the split does not cut": {
+			floatEncoding: chunkenc.EncXOR2,
+			samples: append(
+				manyFloats(seriesToChunkEncoderSplit-1),
+				fSample{5, int64(seriesToChunkEncoderSplit), float64(seriesToChunkEncoderSplit)},
+				fSample{15, int64(seriesToChunkEncoderSplit + 1), float64(seriesToChunkEncoderSplit + 1)},
+			),
+			expected: []expectedChunk{
+				{chunkenc.EncXOR2, append(
+					manyFloats(seriesToChunkEncoderSplit-1),
+					fSample{5, int64(seriesToChunkEncoderSplit), float64(seriesToChunkEncoderSplit)},
+				)},
+				{chunkenc.EncXOR2, []chunks.Sample{
+					fSample{15, int64(seriesToChunkEncoderSplit + 1), float64(seriesToChunkEncoderSplit + 1)},
+				}},
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			series := NewListSeries(lbs, tc.samples)
+			var encoder ChunkSeries
+			if tc.useDefaultConstructor {
+				encoder = NewSeriesToChunkEncoder(series)
+			} else {
+				encoder = NewSeriesToChunkEncoderWithFloatEncoding(series, tc.floatEncoding)
+			}
+
+			chks, err := ExpandChunks(encoder.Iterator(nil))
+			require.NoError(t, err)
+			require.Len(t, chks, len(tc.expected))
+
+			for i, exp := range tc.expected {
+				require.Equalf(t, exp.encoding, chks[i].Chunk.Encoding(), "chunk %d encoding", i)
+				actSamples, err := ExpandSamples(chks[i].Chunk.Iterator(nil), nil)
+				require.NoError(t, err)
+				require.Lenf(t, actSamples, len(exp.samples), "chunk %d sample count", i)
+				for j, expSample := range exp.samples {
+					require.Equalf(t, expSample.Type(), actSamples[j].Type(), "chunk %d sample %d type", i, j)
+					require.Equalf(t, expSample.T(), actSamples[j].T(), "chunk %d sample %d timestamp", i, j)
+					require.Equalf(t, expSample.ST(), actSamples[j].ST(), "chunk %d sample %d start timestamp", i, j)
+					if expSample.Type() == chunkenc.ValFloat {
+						require.Equalf(t, expSample.F(), actSamples[j].F(), "chunk %d sample %d value", i, j)
+					}
+				}
+			}
+		})
 	}
 }
 

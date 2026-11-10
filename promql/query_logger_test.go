@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,17 +15,56 @@ package promql
 
 import (
 	"context"
+	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/grafana/regexp"
 	"github.com/stretchr/testify/require"
 )
 
+type queryLogWriter struct {
+	written int
+	err     error
+}
+
+func (w *queryLogWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	w.written += len(p)
+	return len(p), nil
+}
+
+func (*queryLogWriter) Sync() error {
+	return nil
+}
+
+type shortQueryLogWriter struct{}
+
+func (*shortQueryLogWriter) Write(p []byte) (int, error) {
+	return len(p) - 1, nil
+}
+
+func (*shortQueryLogWriter) Sync() error {
+	return nil
+}
+
+type syncErrorQueryLogWriter struct {
+	queryLogWriter
+	syncErr error
+}
+
+func (w *syncErrorQueryLogWriter) Sync() error {
+	return w.syncErr
+}
+
 func TestQueryLogging(t *testing.T) {
 	fileAsBytes := make([]byte, 4096)
 	queryLogger := ActiveQueryTracker{
-		mmapedFile:   fileAsBytes,
+		mmappedFile:  fileAsBytes,
 		logger:       nil,
 		getNextIndex: make(chan int, 4),
 	}
@@ -47,7 +86,7 @@ func TestQueryLogging(t *testing.T) {
 	}
 
 	// Check for inserts of queries.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		start := 1 + i*entrySize
 		end := start + entrySize
 
@@ -59,7 +98,7 @@ func TestQueryLogging(t *testing.T) {
 	}
 
 	// Check if all queries have been deleted.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		queryLogger.Delete(1 + i*entrySize)
 	}
 	require.True(t, regexp.MustCompile(`^\x00+$`).Match(fileAsBytes[1:1+entrySize*4]),
@@ -69,7 +108,7 @@ func TestQueryLogging(t *testing.T) {
 func TestIndexReuse(t *testing.T) {
 	queryBytes := make([]byte, 1+3*entrySize)
 	queryLogger := ActiveQueryTracker{
-		mmapedFile:   queryBytes,
+		mmappedFile:  queryBytes,
 		logger:       nil,
 		getNextIndex: make(chan int, 3),
 	}
@@ -93,7 +132,7 @@ func TestIndexReuse(t *testing.T) {
 	}
 
 	// Check all bytes and verify new query was inserted at index 2
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		start := 1 + i*entrySize
 		end := start + entrySize
 
@@ -104,29 +143,92 @@ func TestIndexReuse(t *testing.T) {
 }
 
 func TestMMapFile(t *testing.T) {
-	file, err := os.CreateTemp("", "mmapedFile")
+	dir := t.TempDir()
+	fpath := filepath.Join(dir, "mmappedFile")
+	const data = "ab"
+
+	fileAsBytes, closer, err := getMMappedFile(fpath, 2, nil)
 	require.NoError(t, err)
+	copy(fileAsBytes, data)
+	require.NoError(t, closer.Close())
 
-	filename := file.Name()
-	defer os.Remove(filename)
-
-	fileAsBytes, closer, err := getMMapedFile(filename, 2, nil)
-	if err != nil {
-		t.Cleanup(func() { closer.Close() })
-	}
-
+	f, err := os.Open(fpath)
 	require.NoError(t, err)
-	copy(fileAsBytes, "ab")
-
-	f, err := os.Open(filename)
-	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = f.Close()
+	})
 
 	bytes := make([]byte, 4)
 	n, err := f.Read(bytes)
-	require.Equal(t, 2, n)
 	require.NoError(t, err, "Unexpected error while reading file.")
+	require.Equal(t, 2, n)
+	require.Equal(t, []byte(data), bytes[:2], "Mmap failed")
+}
 
-	require.Equal(t, fileAsBytes, bytes[:2], "Mmap failed")
+func TestAllocateQueryLogFile(t *testing.T) {
+	writer := &queryLogWriter{}
+	require.NoError(t, allocateQueryLogFile(writer, 100_000))
+	require.Equal(t, 100_000, writer.written)
+}
+
+func TestAllocateQueryLogFileReturnsWriteErrors(t *testing.T) {
+	require.ErrorIs(t, allocateQueryLogFile(&queryLogWriter{err: os.ErrPermission}, 1), os.ErrPermission)
+	require.ErrorIs(t, allocateQueryLogFile(&shortQueryLogWriter{}, 1), io.ErrShortWrite)
+}
+
+func TestAllocateQueryLogFileReturnsSyncError(t *testing.T) {
+	require.ErrorIs(t, allocateQueryLogFile(&syncErrorQueryLogWriter{syncErr: os.ErrPermission}, 1), os.ErrPermission)
+}
+
+func TestNewActiveQueryTrackerReturnsError(t *testing.T) {
+	localStoragePath := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(localStoragePath, nil, 0o666))
+
+	logger := slog.New(slog.DiscardHandler)
+	queryLogger, err := NewActiveQueryTracker(localStoragePath, 1, logger)
+	require.Error(t, err)
+	require.Nil(t, queryLogger)
+}
+
+func TestTrimStringByBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		input    string
+		size     int
+		expected string
+	}{
+		{
+			name:     "normal ASCII string",
+			input:    "hello",
+			size:     3,
+			expected: "hel",
+		},
+		{
+			name:     "no trimming needed",
+			input:    "hi",
+			size:     10,
+			expected: "hi",
+		},
+		{
+			name:     "UTF-8 multibyte character boundary",
+			input:    "日本", // 6 bytes (3 bytes per character)
+			size:     4,
+			expected: "日", // trims back to complete character boundary
+		},
+		{
+			name:     "invalid UTF-8 continuation-only bytes",
+			input:    string([]byte{0x80, 0x81, 0x82, 0x83, 0x84}), // only continuation bytes
+			size:     4,
+			expected: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NotPanics(t, func() {
+				result := trimStringByBytes(tc.input, tc.size)
+				require.Equal(t, tc.expected, result)
+			})
+		})
+	}
 }
 
 func TestParseBrokenJSON(t *testing.T) {

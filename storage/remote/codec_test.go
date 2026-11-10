@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,17 +15,28 @@ package remote
 
 import (
 	"bytes"
+	"compress/gzip"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/gogo/protobuf/proto"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/collector/pdata/pmetric"
+	"go.opentelemetry.io/collector/pdata/pmetric/pmetricotlp"
 
+	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/prompb"
+	writev2 "github.com/prometheus/prometheus/prompb/io/prometheus/write/v2"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -33,45 +44,178 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
-var testHistogram = histogram.Histogram{
-	Schema:          2,
-	ZeroThreshold:   1e-128,
-	ZeroCount:       0,
-	Count:           0,
-	Sum:             20,
-	PositiveSpans:   []histogram.Span{{Offset: 0, Length: 1}},
-	PositiveBuckets: []int64{1},
-	NegativeSpans:   []histogram.Span{{Offset: 0, Length: 1}},
-	NegativeBuckets: []int64{-1},
+var (
+	testHistogram = histogram.Histogram{
+		Schema:          2,
+		ZeroThreshold:   1e-128,
+		ZeroCount:       0,
+		Count:           3,
+		Sum:             20,
+		PositiveSpans:   []histogram.Span{{Offset: 0, Length: 1}},
+		PositiveBuckets: []int64{1},
+		NegativeSpans:   []histogram.Span{{Offset: 0, Length: 1}},
+		NegativeBuckets: []int64{2},
+	}
+
+	writeRequestFixture = &prompb.WriteRequest{
+		Timeseries: []prompb.TimeSeries{
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "test_metric1"},
+					{Name: "b", Value: "c"},
+					{Name: "baz", Value: "qux"},
+					{Name: "d", Value: "e"},
+					{Name: "foo", Value: "bar"},
+				},
+				Samples:    []prompb.Sample{{Value: 1, Timestamp: 1}},
+				Exemplars:  []prompb.Exemplar{{Labels: []prompb.Label{{Name: "f", Value: "g"}}, Value: 1, Timestamp: 1}},
+				Histograms: []prompb.Histogram{prompb.FromIntHistogram(1, &testHistogram), prompb.FromFloatHistogram(2, testHistogram.ToFloat(nil))},
+			},
+			{
+				Labels: []prompb.Label{
+					{Name: "__name__", Value: "test_metric1"},
+					{Name: "b", Value: "c"},
+					{Name: "baz", Value: "qux"},
+					{Name: "d", Value: "e"},
+					{Name: "foo", Value: "bar"},
+				},
+				Samples:    []prompb.Sample{{Value: 2, Timestamp: 2}},
+				Exemplars:  []prompb.Exemplar{{Labels: []prompb.Label{{Name: "h", Value: "i"}}, Value: 2, Timestamp: 2}},
+				Histograms: []prompb.Histogram{prompb.FromIntHistogram(3, &testHistogram), prompb.FromFloatHistogram(4, testHistogram.ToFloat(nil))},
+			},
+		},
+	}
+
+	writeV2RequestSeries1Metadata = metadata.Metadata{
+		Type: model.MetricTypeGauge,
+		Help: "Test gauge for test purposes",
+		Unit: "Maybe op/sec who knows (:",
+	}
+	writeV2RequestSeries2Metadata = metadata.Metadata{
+		Type: model.MetricTypeCounter,
+		Help: "Test counter for test purposes",
+	}
+
+	testHistogramCustomBuckets = histogram.Histogram{
+		Schema:          histogram.CustomBucketsSchema,
+		Count:           16,
+		Sum:             20,
+		PositiveSpans:   []histogram.Span{{Offset: 1, Length: 2}},
+		PositiveBuckets: []int64{10, -4},     // Means 10 observations for upper bound 1.0 and 6 for upper bound +Inf.
+		CustomValues:    []float64{0.1, 1.0}, // +Inf is implied.
+	}
+
+	// writeV2RequestFixture represents the same request as writeRequestFixture,
+	// but using the v2 representation, plus includes writeV2RequestSeries1Metadata and writeV2RequestSeries2Metadata.
+	// NOTE: Use TestWriteV2RequestFixture and copy the diff to regenerate if needed.
+	writeV2RequestFixture = &writev2.Request{
+		Symbols: []string{"", "__name__", "test_metric1", "b", "c", "baz", "qux", "d", "e", "foo", "bar", "f", "g", "h", "i", "Test gauge for test purposes", "Maybe op/sec who knows (:", "Test counter for test purposes"},
+		Timeseries: []writev2.TimeSeries{
+			{
+				LabelsRefs: []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, // Symbolized writeRequestFixture.Timeseries[0].Labels
+				Metadata: writev2.Metadata{
+					Type: writev2.Metadata_METRIC_TYPE_GAUGE, // writeV2RequestSeries1Metadata.Type.
+
+					HelpRef: 15, // Symbolized writeV2RequestSeries1Metadata.Help.
+					UnitRef: 16, // Symbolized writeV2RequestSeries1Metadata.Unit.
+				},
+				Samples:   []writev2.Sample{{Value: 1, Timestamp: 10, StartTimestamp: 1}}, // ST needs to be lower than the sample's timestamp.
+				Exemplars: []writev2.Exemplar{{LabelsRefs: []uint32{11, 12}, Value: 1, Timestamp: 10}},
+				Histograms: []writev2.Histogram{
+					writev2.FromIntHistogram(1, 10, &testHistogram),
+					writev2.FromFloatHistogram(2, 20, testHistogram.ToFloat(nil)),
+					writev2.FromIntHistogram(11, 30, &testHistogramCustomBuckets),
+					writev2.FromFloatHistogram(21, 40, testHistogramCustomBuckets.ToFloat(nil)),
+				},
+			},
+			{
+				LabelsRefs: []uint32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, // Same series as first.
+				Metadata: writev2.Metadata{
+					Type: writev2.Metadata_METRIC_TYPE_COUNTER, // writeV2RequestSeries2Metadata.Type.
+
+					HelpRef: 17, // Symbolized writeV2RequestSeries2Metadata.Help.
+					// No unit.
+				},
+				Samples:   []writev2.Sample{{Value: 2, Timestamp: 20}},
+				Exemplars: []writev2.Exemplar{{LabelsRefs: []uint32{13, 14}, Value: 2, Timestamp: 20}},
+				Histograms: []writev2.Histogram{
+					writev2.FromIntHistogram(31, 50, &testHistogram),
+					writev2.FromFloatHistogram(41, 60, testHistogram.ToFloat(nil)),
+					writev2.FromIntHistogram(51, 70, &testHistogramCustomBuckets),
+					writev2.FromFloatHistogram(61, 80, testHistogramCustomBuckets.ToFloat(nil)),
+				},
+			},
+		},
+	}
+)
+
+func TestHistogramFixtureValid(t *testing.T) {
+	for _, ts := range writeRequestFixture.Timeseries {
+		for _, h := range ts.Histograms {
+			if h.IsFloatHistogram() {
+				require.NoError(t, h.ToFloatHistogram().Validate())
+			} else {
+				require.NoError(t, h.ToIntHistogram().Validate())
+			}
+		}
+	}
+	for _, ts := range writeV2RequestFixture.Timeseries {
+		for _, h := range ts.Histograms {
+			if h.IsFloatHistogram() {
+				require.NoError(t, h.ToFloatHistogram().Validate())
+			} else {
+				require.NoError(t, h.ToIntHistogram().Validate())
+			}
+		}
+	}
 }
 
-var writeRequestFixture = &prompb.WriteRequest{
-	Timeseries: []prompb.TimeSeries{
-		{
-			Labels: []prompb.Label{
-				{Name: "__name__", Value: "test_metric1"},
-				{Name: "b", Value: "c"},
-				{Name: "baz", Value: "qux"},
-				{Name: "d", Value: "e"},
-				{Name: "foo", Value: "bar"},
+func TestWriteV2RequestFixture(t *testing.T) {
+	// Generate dynamically writeV2RequestFixture, reusing v1 fixture elements.
+	st := writev2.NewSymbolTable()
+	b := labels.NewScratchBuilder(0)
+	labelRefs := st.SymbolizeLabels(writeRequestFixture.Timeseries[0].ToLabels(&b, nil), nil)
+	exemplar1LabelRefs := st.SymbolizeLabels(writeRequestFixture.Timeseries[0].Exemplars[0].ToExemplar(&b, nil).Labels, nil)
+	exemplar2LabelRefs := st.SymbolizeLabels(writeRequestFixture.Timeseries[1].Exemplars[0].ToExemplar(&b, nil).Labels, nil)
+	expected := &writev2.Request{
+		Timeseries: []writev2.TimeSeries{
+			{
+				LabelsRefs: labelRefs,
+				Metadata: writev2.Metadata{
+					Type:    writev2.Metadata_METRIC_TYPE_GAUGE,
+					HelpRef: st.Symbolize(writeV2RequestSeries1Metadata.Help),
+					UnitRef: st.Symbolize(writeV2RequestSeries1Metadata.Unit),
+				},
+				Samples:   []writev2.Sample{{Value: 1, Timestamp: 10, StartTimestamp: 1}},
+				Exemplars: []writev2.Exemplar{{LabelsRefs: exemplar1LabelRefs, Value: 1, Timestamp: 10}},
+				Histograms: []writev2.Histogram{
+					writev2.FromIntHistogram(1, 10, &testHistogram),
+					writev2.FromFloatHistogram(2, 20, testHistogram.ToFloat(nil)),
+					writev2.FromIntHistogram(11, 30, &testHistogramCustomBuckets),
+					writev2.FromFloatHistogram(21, 40, testHistogramCustomBuckets.ToFloat(nil)),
+				},
 			},
-			Samples:    []prompb.Sample{{Value: 1, Timestamp: 0}},
-			Exemplars:  []prompb.Exemplar{{Labels: []prompb.Label{{Name: "f", Value: "g"}}, Value: 1, Timestamp: 0}},
-			Histograms: []prompb.Histogram{HistogramToHistogramProto(0, &testHistogram), FloatHistogramToHistogramProto(1, testHistogram.ToFloat(nil))},
-		},
-		{
-			Labels: []prompb.Label{
-				{Name: "__name__", Value: "test_metric1"},
-				{Name: "b", Value: "c"},
-				{Name: "baz", Value: "qux"},
-				{Name: "d", Value: "e"},
-				{Name: "foo", Value: "bar"},
+			{
+				LabelsRefs: labelRefs,
+				Metadata: writev2.Metadata{
+					Type:    writev2.Metadata_METRIC_TYPE_COUNTER,
+					HelpRef: st.Symbolize(writeV2RequestSeries2Metadata.Help),
+					// No unit.
+				},
+				Samples:   []writev2.Sample{{Value: 2, Timestamp: 20}},
+				Exemplars: []writev2.Exemplar{{LabelsRefs: exemplar2LabelRefs, Value: 2, Timestamp: 20}},
+				Histograms: []writev2.Histogram{
+					writev2.FromIntHistogram(31, 50, &testHistogram),
+					writev2.FromFloatHistogram(41, 60, testHistogram.ToFloat(nil)),
+					writev2.FromIntHistogram(51, 70, &testHistogramCustomBuckets),
+					writev2.FromFloatHistogram(61, 80, testHistogramCustomBuckets.ToFloat(nil)),
+				},
 			},
-			Samples:    []prompb.Sample{{Value: 2, Timestamp: 1}},
-			Exemplars:  []prompb.Exemplar{{Labels: []prompb.Label{{Name: "h", Value: "i"}}, Value: 2, Timestamp: 1}},
-			Histograms: []prompb.Histogram{HistogramToHistogramProto(2, &testHistogram), FloatHistogramToHistogramProto(3, testHistogram.ToFloat(nil))},
 		},
-	},
+		Symbols: st.Symbols(),
+	}
+	// Check if it matches static writeV2RequestFixture.
+	require.Equal(t, expected, writeV2RequestFixture)
 }
 
 func TestValidateLabelsAndMetricName(t *testing.T) {
@@ -99,18 +243,10 @@ func TestValidateLabelsAndMetricName(t *testing.T) {
 		{
 			input: []prompb.Label{
 				{Name: "__name__", Value: "name"},
-				{Name: "@labelName", Value: "labelValue"},
+				{Name: "@labelName\xff", Value: "labelValue"},
 			},
-			expectedErr: "invalid label name: @labelName",
-			description: "label name with @",
-		},
-		{
-			input: []prompb.Label{
-				{Name: "__name__", Value: "name"},
-				{Name: "123labelName", Value: "labelValue"},
-			},
-			expectedErr: "invalid label name: 123labelName",
-			description: "label name starts with numbers",
+			expectedErr: "invalid label name: @labelName\xff",
+			description: "label name with \xff",
 		},
 		{
 			input: []prompb.Label{
@@ -130,10 +266,10 @@ func TestValidateLabelsAndMetricName(t *testing.T) {
 		},
 		{
 			input: []prompb.Label{
-				{Name: "__name__", Value: "@invalid_name"},
+				{Name: "__name__", Value: "invalid_name\xff"},
 			},
-			expectedErr: "invalid metric name: @invalid_name",
-			description: "metric name starts with @",
+			expectedErr: "invalid metric name: invalid_name\xff",
+			description: "metric name has invalid utf8",
 		},
 		{
 			input: []prompb.Label{
@@ -165,8 +301,7 @@ func TestValidateLabelsAndMetricName(t *testing.T) {
 		t.Run(test.description, func(t *testing.T) {
 			err := validateLabelsAndMetricName(test.input)
 			if test.expectedErr != "" {
-				require.Error(t, err)
-				require.Equal(t, test.expectedErr, err.Error())
+				require.EqualError(t, err, test.expectedErr)
 			} else {
 				require.NoError(t, err)
 			}
@@ -268,7 +403,7 @@ func TestConcreteSeriesIterator_HistogramSamples(t *testing.T) {
 		} else {
 			ts = int64(i)
 		}
-		histProtos[i] = HistogramToHistogramProto(ts, h)
+		histProtos[i] = prompb.FromIntHistogram(ts, h)
 	}
 	series := &concreteSeries{
 		labels:     labels.FromStrings("foo", "bar"),
@@ -319,9 +454,9 @@ func TestConcreteSeriesIterator_FloatAndHistogramSamples(t *testing.T) {
 	histProtos := make([]prompb.Histogram, len(histograms))
 	for i, h := range histograms {
 		if i < 10 {
-			histProtos[i] = HistogramToHistogramProto(int64(i+1), h)
+			histProtos[i] = prompb.FromIntHistogram(int64(i+1), h)
 		} else {
-			histProtos[i] = HistogramToHistogramProto(int64(i+6), h)
+			histProtos[i] = prompb.FromIntHistogram(int64(i+6), h)
 		}
 	}
 	series := &concreteSeries{
@@ -401,11 +536,11 @@ func TestConcreteSeriesIterator_FloatAndHistogramSamples(t *testing.T) {
 	require.Equal(t, chunkenc.ValHistogram, it.Next())
 	ts, fh = it.AtFloatHistogram(nil)
 	require.Equal(t, int64(17), ts)
-	expected := HistogramProtoToFloatHistogram(HistogramToHistogramProto(int64(17), histograms[11]))
+	expected := prompb.FromIntHistogram(int64(17), histograms[11]).ToFloatHistogram()
 	require.Equal(t, expected, fh)
 
 	// Keep calling Next() until the end.
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		require.Equal(t, chunkenc.ValHistogram, it.Next())
 	}
 
@@ -414,6 +549,120 @@ func TestConcreteSeriesIterator_FloatAndHistogramSamples(t *testing.T) {
 	require.Equal(t, chunkenc.ValNone, it.Next())
 	// Should also not be able to seek backwards again.
 	require.Equal(t, chunkenc.ValNone, it.Seek(1))
+}
+
+func TestConcreteSeriesIterator_HistogramSamplesWithInvalidSchema(t *testing.T) {
+	for _, schema := range []int32{-100, 100} {
+		t.Run(fmt.Sprintf("schema=%d", schema), func(t *testing.T) {
+			h := prompb.FromIntHistogram(2, &testHistogram)
+			h.Schema = schema
+			fh := prompb.FromFloatHistogram(4, testHistogram.ToFloat(nil))
+			fh.Schema = schema
+			series := &concreteSeries{
+				labels: labels.FromStrings("foo", "bar"),
+				floats: []prompb.Sample{
+					{Value: 1, Timestamp: 0},
+					{Value: 2, Timestamp: 3},
+				},
+				histograms: []prompb.Histogram{
+					h,
+					fh,
+				},
+			}
+			it := series.Iterator(nil)
+			require.Equal(t, chunkenc.ValFloat, it.Next())
+			require.Equal(t, chunkenc.ValNone, it.Next())
+			require.Error(t, it.Err())
+			require.ErrorIs(t, it.Err(), histogram.ErrHistogramsUnknownSchema)
+
+			it = series.Iterator(it)
+			require.Equal(t, chunkenc.ValFloat, it.Next())
+			require.Equal(t, chunkenc.ValNone, it.Next())
+			require.ErrorIs(t, it.Err(), histogram.ErrHistogramsUnknownSchema)
+
+			it = series.Iterator(it)
+			require.Equal(t, chunkenc.ValNone, it.Seek(1))
+			require.ErrorIs(t, it.Err(), histogram.ErrHistogramsUnknownSchema)
+
+			it = series.Iterator(it)
+			require.Equal(t, chunkenc.ValFloat, it.Seek(3))
+			require.Equal(t, chunkenc.ValNone, it.Next())
+			require.ErrorIs(t, it.Err(), histogram.ErrHistogramsUnknownSchema)
+
+			it = series.Iterator(it)
+			require.Equal(t, chunkenc.ValNone, it.Seek(4))
+			require.ErrorIs(t, it.Err(), histogram.ErrHistogramsUnknownSchema)
+		})
+	}
+}
+
+func TestConcreteSeriesIterator_HistogramSamplesWithMissingBucket(t *testing.T) {
+	mh := testHistogram.Copy()
+	mh.PositiveSpans = []histogram.Span{{Offset: 0, Length: 2}}
+	h := prompb.FromIntHistogram(2, mh)
+	fh := prompb.FromFloatHistogram(4, mh.ToFloat(nil))
+	series := &concreteSeries{
+		labels: labels.FromStrings("foo", "bar"),
+		floats: []prompb.Sample{
+			{Value: 1, Timestamp: 0},
+			{Value: 2, Timestamp: 3},
+		},
+		histograms: []prompb.Histogram{
+			h,
+			fh,
+		},
+	}
+	it := series.Iterator(nil)
+	require.Equal(t, chunkenc.ValFloat, it.Next())
+	require.Equal(t, chunkenc.ValNone, it.Next())
+	require.Error(t, it.Err())
+	require.ErrorIs(t, it.Err(), histogram.ErrHistogramSpansBucketsMismatch)
+
+	it = series.Iterator(it)
+	require.Equal(t, chunkenc.ValFloat, it.Next())
+	require.Equal(t, chunkenc.ValNone, it.Next())
+	require.ErrorIs(t, it.Err(), histogram.ErrHistogramSpansBucketsMismatch)
+
+	it = series.Iterator(it)
+	require.Equal(t, chunkenc.ValNone, it.Seek(1))
+	require.ErrorIs(t, it.Err(), histogram.ErrHistogramSpansBucketsMismatch)
+
+	it = series.Iterator(it)
+	require.Equal(t, chunkenc.ValFloat, it.Seek(3))
+	require.Equal(t, chunkenc.ValNone, it.Next())
+	require.ErrorIs(t, it.Err(), histogram.ErrHistogramSpansBucketsMismatch)
+
+	it = series.Iterator(it)
+	require.Equal(t, chunkenc.ValNone, it.Seek(4))
+	require.ErrorIs(t, it.Err(), histogram.ErrHistogramSpansBucketsMismatch)
+}
+
+func TestConcreteSeriesIterator_ReducesHighResolutionHistograms(t *testing.T) {
+	for _, schema := range []int32{9, 52} {
+		t.Run(fmt.Sprintf("schema=%d", schema), func(t *testing.T) {
+			h := testHistogram.Copy()
+			h.Schema = schema
+			fh := h.ToFloat(nil)
+			series := &concreteSeries{
+				labels: labels.FromStrings("foo", "bar"),
+				histograms: []prompb.Histogram{
+					prompb.FromIntHistogram(1, h),
+					prompb.FromFloatHistogram(2, fh),
+				},
+			}
+			it := series.Iterator(nil)
+			require.Equal(t, chunkenc.ValHistogram, it.Next())
+			_, gotH := it.AtHistogram(nil)
+			require.Equal(t, histogram.ExponentialSchemaMax, gotH.Schema)
+			_, gotFH := it.AtFloatHistogram(nil)
+			require.Equal(t, histogram.ExponentialSchemaMax, gotFH.Schema)
+			require.Equal(t, chunkenc.ValFloatHistogram, it.Next())
+			_, gotFH = it.AtFloatHistogram(nil)
+			require.Equal(t, histogram.ExponentialSchemaMax, gotFH.Schema)
+			require.Equal(t, chunkenc.ValNone, it.Next())
+			require.NoError(t, it.Err())
+		})
+	}
 }
 
 func TestFromQueryResultWithDuplicates(t *testing.T) {
@@ -439,7 +688,7 @@ func TestFromQueryResultWithDuplicates(t *testing.T) {
 
 	require.True(t, isErrSeriesSet, "Expected resulting series to be an errSeriesSet")
 	errMessage := errSeries.Err().Error()
-	require.Equal(t, "duplicate label with name: foo", errMessage, fmt.Sprintf("Expected error to be from duplicate label, but got: %s", errMessage))
+	require.Equalf(t, "duplicate label with name: foo", errMessage, "Expected error to be from duplicate label, but got: %s", errMessage)
 }
 
 func TestNegotiateResponseType(t *testing.T) {
@@ -463,7 +712,7 @@ func TestNegotiateResponseType(t *testing.T) {
 
 	_, err = NegotiateResponseType([]prompb.ReadRequest_ResponseType{20})
 	require.Error(t, err, "expected error due to not supported requested response types")
-	require.Equal(t, "server does not support any of the requested response types: [20]; supported: map[SAMPLES:{} STREAMED_XOR_CHUNKS:{}]", err.Error())
+	require.EqualError(t, err, "server does not support any of the requested response types: [20]; supported: map[SAMPLES:{} STREAMED_XOR_CHUNKS:{}]")
 }
 
 func TestMergeLabels(t *testing.T) {
@@ -485,39 +734,50 @@ func TestMergeLabels(t *testing.T) {
 	}
 }
 
-func TestMetricTypeToMetricTypeProto(t *testing.T) {
-	tc := []struct {
-		desc     string
-		input    model.MetricType
-		expected prompb.MetricMetadata_MetricType
-	}{
-		{
-			desc:     "with a single-word metric",
-			input:    model.MetricTypeCounter,
-			expected: prompb.MetricMetadata_COUNTER,
-		},
-		{
-			desc:     "with a two-word metric",
-			input:    model.MetricTypeStateset,
-			expected: prompb.MetricMetadata_STATESET,
-		},
-		{
-			desc:     "with an unknown metric",
-			input:    "not-known",
-			expected: prompb.MetricMetadata_UNKNOWN,
-		},
-	}
+func TestDecodeOTLPWriteRequestGzipSizeLimit(t *testing.T) {
+	// Build a valid OTLP request whose serialized protobuf exceeds decodeReadLimit.
+	// A metric description filled with repeated characters compresses very
+	// efficiently, so the gzip payload is small while the decompressed form is
+	// larger than the 32 MiB limit.
+	d := pmetric.NewMetrics()
+	m := d.ResourceMetrics().AppendEmpty().ScopeMetrics().AppendEmpty().Metrics().AppendEmpty()
+	m.SetName("test_metric")
+	m.SetDescription(strings.Repeat("a", decodeReadLimit+1))
+	m.SetEmptyGauge()
 
-	for _, tt := range tc {
-		t.Run(tt.desc, func(t *testing.T) {
-			m := metricTypeToMetricTypeProto(tt.input)
-			require.Equal(t, tt.expected, m)
-		})
-	}
+	proto, err := pmetricotlp.NewExportRequestFromMetrics(d).MarshalProto()
+	require.NoError(t, err)
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	_, err = gz.Write(proto)
+	require.NoError(t, err)
+	require.NoError(t, gz.Close())
+
+	req, err := http.NewRequest(http.MethodPost, "/", &buf)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", pbContentType)
+	req.Header.Set("Content-Encoding", "gzip")
+
+	// The decompressed payload exceeds decodeReadLimit and is truncated, so the
+	// protobuf cannot be parsed into a valid ExportRequest.
+	_, err = DecodeOTLPWriteRequest(req)
+	require.Error(t, err)
+}
+
+func TestDecodeReadRequestTooLarge(t *testing.T) {
+	// 5-byte snappy stream whose header claims 256 MiB decoded length,
+	// well above decodeReadLimit (32 MiB).
+	bomb := []byte{0x80, 0x80, 0x80, 0x80, 0x01}
+	req, err := http.NewRequest(http.MethodPost, "/", bytes.NewReader(bomb))
+	require.NoError(t, err)
+
+	_, err = DecodeReadRequest(req)
+	require.ErrorContains(t, err, "exceeds limit")
 }
 
 func TestDecodeWriteRequest(t *testing.T) {
-	buf, _, _, err := buildWriteRequest(nil, writeRequestFixture.Timeseries, nil, nil, nil, nil)
+	buf, _, _, err := buildWriteRequest(nil, writeRequestFixture.Timeseries, nil, nil, nil, nil, "snappy")
 	require.NoError(t, err)
 
 	actual, err := DecodeWriteRequest(bytes.NewReader(buf))
@@ -525,212 +785,18 @@ func TestDecodeWriteRequest(t *testing.T) {
 	require.Equal(t, writeRequestFixture, actual)
 }
 
-func TestNilHistogramProto(*testing.T) {
-	// This function will panic if it impromperly handles nil
-	// values, causing the test to fail.
-	HistogramProtoToHistogram(prompb.Histogram{})
-	HistogramProtoToFloatHistogram(prompb.Histogram{})
-}
+func TestDecodeWriteV2Request(t *testing.T) {
+	buf, _, _, _, err := buildV2WriteRequest(promslog.NewNopLogger(), writeV2RequestFixture.Timeseries, writeV2RequestFixture.Symbols, nil, nil, nil, "snappy")
+	require.NoError(t, err)
 
-func exampleHistogram() histogram.Histogram {
-	return histogram.Histogram{
-		CounterResetHint: histogram.GaugeType,
-		Schema:           0,
-		Count:            19,
-		Sum:              2.7,
-		PositiveSpans: []histogram.Span{
-			{Offset: 0, Length: 4},
-			{Offset: 0, Length: 0},
-			{Offset: 0, Length: 3},
-		},
-		PositiveBuckets: []int64{1, 2, -2, 1, -1, 0, 0},
-		NegativeSpans: []histogram.Span{
-			{Offset: 0, Length: 5},
-			{Offset: 1, Length: 0},
-			{Offset: 0, Length: 1},
-		},
-		NegativeBuckets: []int64{1, 2, -2, 1, -1, 0},
-	}
-}
-
-func exampleHistogramProto() prompb.Histogram {
-	return prompb.Histogram{
-		Count:         &prompb.Histogram_CountInt{CountInt: 19},
-		Sum:           2.7,
-		Schema:        0,
-		ZeroThreshold: 0,
-		ZeroCount:     &prompb.Histogram_ZeroCountInt{ZeroCountInt: 0},
-		NegativeSpans: []prompb.BucketSpan{
-			{
-				Offset: 0,
-				Length: 5,
-			},
-			{
-				Offset: 1,
-				Length: 0,
-			},
-			{
-				Offset: 0,
-				Length: 1,
-			},
-		},
-		NegativeDeltas: []int64{1, 2, -2, 1, -1, 0},
-		PositiveSpans: []prompb.BucketSpan{
-			{
-				Offset: 0,
-				Length: 4,
-			},
-			{
-				Offset: 0,
-				Length: 0,
-			},
-			{
-				Offset: 0,
-				Length: 3,
-			},
-		},
-		PositiveDeltas: []int64{1, 2, -2, 1, -1, 0, 0},
-		ResetHint:      prompb.Histogram_GAUGE,
-		Timestamp:      1337,
-	}
-}
-
-func TestHistogramToProtoConvert(t *testing.T) {
-	tests := []struct {
-		input    histogram.CounterResetHint
-		expected prompb.Histogram_ResetHint
-	}{
-		{
-			input:    histogram.UnknownCounterReset,
-			expected: prompb.Histogram_UNKNOWN,
-		},
-		{
-			input:    histogram.CounterReset,
-			expected: prompb.Histogram_YES,
-		},
-		{
-			input:    histogram.NotCounterReset,
-			expected: prompb.Histogram_NO,
-		},
-		{
-			input:    histogram.GaugeType,
-			expected: prompb.Histogram_GAUGE,
-		},
-	}
-
-	for _, test := range tests {
-		h := exampleHistogram()
-		h.CounterResetHint = test.input
-		p := exampleHistogramProto()
-		p.ResetHint = test.expected
-
-		require.Equal(t, p, HistogramToHistogramProto(1337, &h))
-
-		require.Equal(t, h, *HistogramProtoToHistogram(p))
-	}
-}
-
-func exampleFloatHistogram() histogram.FloatHistogram {
-	return histogram.FloatHistogram{
-		CounterResetHint: histogram.GaugeType,
-		Schema:           0,
-		Count:            19,
-		Sum:              2.7,
-		PositiveSpans: []histogram.Span{
-			{Offset: 0, Length: 4},
-			{Offset: 0, Length: 0},
-			{Offset: 0, Length: 3},
-		},
-		PositiveBuckets: []float64{1, 2, -2, 1, -1, 0, 0},
-		NegativeSpans: []histogram.Span{
-			{Offset: 0, Length: 5},
-			{Offset: 1, Length: 0},
-			{Offset: 0, Length: 1},
-		},
-		NegativeBuckets: []float64{1, 2, -2, 1, -1, 0},
-	}
-}
-
-func exampleFloatHistogramProto() prompb.Histogram {
-	return prompb.Histogram{
-		Count:         &prompb.Histogram_CountFloat{CountFloat: 19},
-		Sum:           2.7,
-		Schema:        0,
-		ZeroThreshold: 0,
-		ZeroCount:     &prompb.Histogram_ZeroCountFloat{ZeroCountFloat: 0},
-		NegativeSpans: []prompb.BucketSpan{
-			{
-				Offset: 0,
-				Length: 5,
-			},
-			{
-				Offset: 1,
-				Length: 0,
-			},
-			{
-				Offset: 0,
-				Length: 1,
-			},
-		},
-		NegativeCounts: []float64{1, 2, -2, 1, -1, 0},
-		PositiveSpans: []prompb.BucketSpan{
-			{
-				Offset: 0,
-				Length: 4,
-			},
-			{
-				Offset: 0,
-				Length: 0,
-			},
-			{
-				Offset: 0,
-				Length: 3,
-			},
-		},
-		PositiveCounts: []float64{1, 2, -2, 1, -1, 0, 0},
-		ResetHint:      prompb.Histogram_GAUGE,
-		Timestamp:      1337,
-	}
-}
-
-func TestFloatHistogramToProtoConvert(t *testing.T) {
-	tests := []struct {
-		input    histogram.CounterResetHint
-		expected prompb.Histogram_ResetHint
-	}{
-		{
-			input:    histogram.UnknownCounterReset,
-			expected: prompb.Histogram_UNKNOWN,
-		},
-		{
-			input:    histogram.CounterReset,
-			expected: prompb.Histogram_YES,
-		},
-		{
-			input:    histogram.NotCounterReset,
-			expected: prompb.Histogram_NO,
-		},
-		{
-			input:    histogram.GaugeType,
-			expected: prompb.Histogram_GAUGE,
-		},
-	}
-
-	for _, test := range tests {
-		h := exampleFloatHistogram()
-		h.CounterResetHint = test.input
-		p := exampleFloatHistogramProto()
-		p.ResetHint = test.expected
-
-		require.Equal(t, p, FloatHistogramToHistogramProto(1337, &h))
-
-		require.Equal(t, h, *FloatHistogramProtoToFloatHistogram(p))
-	}
+	actual, err := DecodeWriteV2Request(bytes.NewReader(buf))
+	require.NoError(t, err)
+	require.Equal(t, writeV2RequestFixture, actual)
 }
 
 func TestStreamResponse(t *testing.T) {
-	lbs1 := labelsToLabelsProto(labels.FromStrings("instance", "localhost1", "job", "demo1"), nil)
-	lbs2 := labelsToLabelsProto(labels.FromStrings("instance", "localhost2", "job", "demo2"), nil)
+	lbs1 := prompb.FromLabels(labels.FromStrings("instance", "localhost1", "job", "demo1"), nil)
+	lbs2 := prompb.FromLabels(labels.FromStrings("instance", "localhost2", "job", "demo2"), nil)
 	chunk := prompb.Chunk{
 		Type: prompb.Chunk_XOR,
 		Data: make([]byte, 100),
@@ -802,7 +868,7 @@ func (c *mockChunkSeriesSet) Next() bool {
 
 func (c *mockChunkSeriesSet) At() storage.ChunkSeries {
 	return &storage.ChunkSeriesEntry{
-		Lset: labelProtosToLabels(&c.builder, c.chunkedSeries[c.index].Labels),
+		Lset: c.chunkedSeries[c.index].ToLabels(&c.builder, nil),
 		ChunkIteratorFn: func(chunks.Iterator) chunks.Iterator {
 			return &mockChunkIterator{
 				chunks: c.chunkedSeries[c.index].Chunks,
@@ -812,9 +878,9 @@ func (c *mockChunkSeriesSet) At() storage.ChunkSeries {
 	}
 }
 
-func (c *mockChunkSeriesSet) Warnings() annotations.Annotations { return nil }
+func (*mockChunkSeriesSet) Warnings() annotations.Annotations { return nil }
 
-func (c *mockChunkSeriesSet) Err() error {
+func (*mockChunkSeriesSet) Err() error {
 	return nil
 }
 
@@ -841,6 +907,303 @@ func (c *mockChunkIterator) Next() bool {
 	return c.index < len(c.chunks)
 }
 
-func (c *mockChunkIterator) Err() error {
+func (*mockChunkIterator) Err() error {
 	return nil
+}
+
+func TestChunkedSeriesIterator(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		chks := buildTestChunks(t)
+
+		it := newChunkedSeriesIterator(chks, 2000, 12000)
+
+		require.NoError(t, it.err)
+		require.NotNil(t, it.cur)
+
+		// Initial next; advance to first valid sample of first chunk.
+		res := it.Next()
+		require.Equal(t, chunkenc.ValFloat, res)
+		require.NoError(t, it.Err())
+
+		ts, v := it.At()
+		require.Equal(t, int64(2000), ts)
+		require.Equal(t, float64(2), v)
+
+		// Next to the second sample of the first chunk.
+		res = it.Next()
+		require.Equal(t, chunkenc.ValFloat, res)
+		require.NoError(t, it.Err())
+
+		ts, v = it.At()
+		require.Equal(t, int64(3000), ts)
+		require.Equal(t, float64(3), v)
+
+		// Attempt to seek to the first sample of the first chunk (should return current sample).
+		res = it.Seek(0)
+		require.Equal(t, chunkenc.ValFloat, res)
+
+		ts, v = it.At()
+		require.Equal(t, int64(3000), ts)
+		require.Equal(t, float64(3), v)
+
+		// Seek to the end of the first chunk.
+		res = it.Seek(4000)
+		require.Equal(t, chunkenc.ValFloat, res)
+
+		ts, v = it.At()
+		require.Equal(t, int64(4000), ts)
+		require.Equal(t, float64(4), v)
+
+		// Next to the first sample of the second chunk.
+		res = it.Next()
+		require.Equal(t, chunkenc.ValFloat, res)
+		require.NoError(t, it.Err())
+
+		ts, v = it.At()
+		require.Equal(t, int64(5000), ts)
+		require.Equal(t, float64(1), v)
+
+		// Seek to the second sample of the third chunk.
+		res = it.Seek(10999)
+		require.Equal(t, chunkenc.ValFloat, res)
+		require.NoError(t, it.Err())
+
+		ts, v = it.At()
+		require.Equal(t, int64(11000), ts)
+		require.Equal(t, float64(3), v)
+
+		// Attempt to seek to something past the last sample (should return false and exhaust the iterator).
+		res = it.Seek(99999)
+		require.Equal(t, chunkenc.ValNone, res)
+		require.NoError(t, it.Err())
+
+		// Attempt to next past the last sample (should return false as the iterator is exhausted).
+		res = it.Next()
+		require.Equal(t, chunkenc.ValNone, res)
+		require.NoError(t, it.Err())
+	})
+
+	t.Run("invalid chunk encoding error", func(t *testing.T) {
+		chks := buildTestChunks(t)
+
+		// Set chunk type to an invalid value.
+		chks[0].Type = 8
+
+		it := newChunkedSeriesIterator(chks, 0, 14000)
+
+		res := it.Next()
+		require.Equal(t, chunkenc.ValNone, res)
+
+		res = it.Seek(1000)
+		require.Equal(t, chunkenc.ValNone, res)
+
+		require.ErrorContains(t, it.err, "invalid chunk encoding")
+		require.Nil(t, it.cur)
+	})
+
+	t.Run("empty chunks", func(t *testing.T) {
+		emptyChunks := make([]prompb.Chunk, 0)
+
+		it1 := newChunkedSeriesIterator(emptyChunks, 0, 1000)
+		require.Equal(t, chunkenc.ValNone, it1.Next())
+		require.Equal(t, chunkenc.ValNone, it1.Seek(1000))
+		require.NoError(t, it1.Err())
+
+		var nilChunks []prompb.Chunk
+
+		it2 := newChunkedSeriesIterator(nilChunks, 0, 1000)
+		require.Equal(t, chunkenc.ValNone, it2.Next())
+		require.Equal(t, chunkenc.ValNone, it2.Seek(1000))
+		require.NoError(t, it2.Err())
+	})
+}
+
+func TestChunkedSeries(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		chks := buildTestChunks(t)
+
+		s := chunkedSeries{
+			ChunkedSeries: prompb.ChunkedSeries{
+				Labels: []prompb.Label{
+					{Name: "foo", Value: "bar"},
+					{Name: "asdf", Value: "zxcv"},
+				},
+				Chunks: chks,
+			},
+		}
+
+		require.Equal(t, labels.FromStrings("asdf", "zxcv", "foo", "bar"), s.Labels())
+
+		it := s.Iterator(nil)
+		res := it.Next() // Behavior is undefined w/o the initial call to Next.
+
+		require.Equal(t, chunkenc.ValFloat, res)
+		require.NoError(t, it.Err())
+
+		ts, v := it.At()
+		require.Equal(t, int64(0), ts)
+		require.Equal(t, float64(0), v)
+	})
+}
+
+func TestChunkedSeriesSet(t *testing.T) {
+	t.Run("happy path", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		flusher := &mockFlusher{}
+
+		w := NewChunkedWriter(buf, flusher)
+		wrappedReader := newOneShotCloser(buf)
+		r := NewChunkedReader(wrappedReader, config.DefaultChunkedReadLimit, nil)
+
+		chks := buildTestChunks(t)
+		l := []prompb.Label{
+			{Name: "foo", Value: "bar"},
+		}
+
+		for i, c := range chks {
+			cSeries := prompb.ChunkedSeries{Labels: l, Chunks: []prompb.Chunk{c}}
+			readResp := prompb.ChunkedReadResponse{
+				ChunkedSeries: []*prompb.ChunkedSeries{&cSeries},
+				QueryIndex:    int64(i),
+			}
+
+			b, err := proto.Marshal(&readResp)
+			require.NoError(t, err)
+
+			_, err = w.Write(b)
+			require.NoError(t, err)
+		}
+
+		ss := NewChunkedSeriesSet(r, wrappedReader, 0, 14000, func(error) {})
+		require.NoError(t, ss.Err())
+		require.Nil(t, ss.Warnings())
+
+		res := ss.Next()
+		require.True(t, res)
+		require.NoError(t, ss.Err())
+
+		s := ss.At()
+		require.Equal(t, 1, s.Labels().Len())
+		require.True(t, s.Labels().Has("foo"))
+		require.Equal(t, "bar", s.Labels().Get("foo"))
+
+		it := s.Iterator(nil)
+		it.Next()
+		ts, v := it.At()
+		require.Equal(t, int64(0), ts)
+		require.Equal(t, float64(0), v)
+
+		numResponses := 1
+		for ss.Next() {
+			numResponses++
+		}
+		require.Equal(t, numTestChunks, numResponses)
+		require.NoError(t, ss.Err())
+
+		require.False(t, ss.Next(), "Next() should still return false after it previously returned false")
+		require.NoError(t, ss.Err(), "Err() should not return an error if Next() is called again after it previously returned false")
+	})
+
+	t.Run("chunked reader error", func(t *testing.T) {
+		buf := &bytes.Buffer{}
+		flusher := &mockFlusher{}
+
+		w := NewChunkedWriter(buf, flusher)
+		r := NewChunkedReader(buf, config.DefaultChunkedReadLimit, nil)
+
+		chks := buildTestChunks(t)
+		l := []prompb.Label{
+			{Name: "foo", Value: "bar"},
+		}
+
+		for i, c := range chks {
+			cSeries := prompb.ChunkedSeries{Labels: l, Chunks: []prompb.Chunk{c}}
+			readResp := prompb.ChunkedReadResponse{
+				ChunkedSeries: []*prompb.ChunkedSeries{&cSeries},
+				QueryIndex:    int64(i),
+			}
+
+			b, err := proto.Marshal(&readResp)
+			require.NoError(t, err)
+
+			b[0] = 0xFF // Corruption!
+
+			_, err = w.Write(b)
+			require.NoError(t, err)
+		}
+
+		ss := NewChunkedSeriesSet(r, io.NopCloser(buf), 0, 14000, func(error) {})
+		require.NoError(t, ss.Err())
+		require.Nil(t, ss.Warnings())
+
+		res := ss.Next()
+		require.False(t, res)
+		require.ErrorContains(t, ss.Err(), "proto: illegal wireType 7")
+	})
+}
+
+// mockFlusher implements http.Flusher.
+type mockFlusher struct{}
+
+func (*mockFlusher) Flush() {}
+
+type oneShotCloser struct {
+	r      io.Reader
+	closed bool
+}
+
+func newOneShotCloser(r io.Reader) io.ReadCloser {
+	return &oneShotCloser{r, false}
+}
+
+func (c *oneShotCloser) Read(p []byte) (n int, err error) {
+	if c.closed {
+		return 0, errors.New("already closed")
+	}
+
+	return c.r.Read(p)
+}
+
+func (c *oneShotCloser) Close() error {
+	if c.closed {
+		return errors.New("already closed")
+	}
+
+	c.closed = true
+	return nil
+}
+
+const (
+	numTestChunks          = 3
+	numSamplesPerTestChunk = 5
+)
+
+func buildTestChunks(t *testing.T) []prompb.Chunk {
+	startTime := int64(0)
+	chks := make([]prompb.Chunk, 0, numTestChunks)
+
+	time := startTime
+
+	for i := range numTestChunks {
+		c := chunkenc.NewXORChunk()
+
+		a, err := c.Appender()
+		require.NoError(t, err)
+
+		minTimeMs := time
+
+		for j := range numSamplesPerTestChunk {
+			a.Append(0, time, float64(i+j))
+			time += int64(1000)
+		}
+
+		chks = append(chks, prompb.Chunk{
+			MinTimeMs: minTimeMs,
+			MaxTimeMs: time,
+			Type:      prompb.Chunk_XOR,
+			Data:      c.Bytes(),
+		})
+	}
+
+	return chks
 }

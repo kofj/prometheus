@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"sort"
+	"sync"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -27,9 +28,38 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/teststorage"
 	"github.com/prometheus/prometheus/util/testutil"
 )
+
+func TestStorage_CostSamplingQueryable_ConfigReload(t *testing.T) {
+	s := NewStorage(nil, prometheus.NewRegistry(), nil, t.TempDir(), defaultFlushDeadline, nil, false, false, false)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	empty := &config.Config{GlobalConfig: config.DefaultGlobalConfig}
+	configured := &config.Config{GlobalConfig: config.DefaultGlobalConfig}
+	reader := config.DefaultRemoteReadConfig
+	reader.URL = &config_util.URL{URL: &url.URL{Scheme: "http", Host: "example.invalid"}}
+	configured.RemoteReadConfigs = []*config.RemoteReadConfig{&reader}
+	for _, cfg := range []*config.Config{empty, configured, empty} {
+		require.NoError(t, s.ApplyConfig(cfg))
+		source, supported := s.CostSamplingQueryable()
+		require.Nil(t, source)
+		require.Equal(t, len(cfg.RemoteReadConfigs) == 0, supported)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for range 50 {
+			_, _ = s.CostSamplingQueryable()
+		}
+	})
+	for range 10 {
+		require.NoError(t, s.ApplyConfig(configured))
+		require.NoError(t, s.ApplyConfig(empty))
+	}
+	wg.Wait()
+}
 
 func TestNoDuplicateReadConfigs(t *testing.T) {
 	dir := t.TempDir()
@@ -92,7 +122,7 @@ func TestNoDuplicateReadConfigs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run("", func(t *testing.T) {
-			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil)
+			s := NewStorage(nil, nil, nil, dir, defaultFlushDeadline, nil, false, false, false)
 			conf := &config.Config{
 				GlobalConfig:      config.DefaultGlobalConfig,
 				RemoteReadConfigs: tc.cfgs,
@@ -172,12 +202,12 @@ func TestSeriesSetFilter(t *testing.T) {
 			toRemove: []string{"foo"},
 			in: &prompb.QueryResult{
 				Timeseries: []*prompb.TimeSeries{
-					{Labels: labelsToLabelsProto(labels.FromStrings("foo", "bar", "a", "b"), nil)},
+					{Labels: prompb.FromLabels(labels.FromStrings("foo", "bar", "a", "b"), nil)},
 				},
 			},
 			expected: &prompb.QueryResult{
 				Timeseries: []*prompb.TimeSeries{
-					{Labels: labelsToLabelsProto(labels.FromStrings("a", "b"), nil)},
+					{Labels: prompb.FromLabels(labels.FromStrings("a", "b"), nil)},
 				},
 			},
 		},
@@ -193,12 +223,13 @@ func TestSeriesSetFilter(t *testing.T) {
 }
 
 type mockedRemoteClient struct {
-	got   *prompb.Query
-	store []*prompb.TimeSeries
-	b     labels.ScratchBuilder
+	got         *prompb.Query
+	gotMultiple []*prompb.Query
+	store       []*prompb.TimeSeries
+	b           labels.ScratchBuilder
 }
 
-func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query) (*prompb.QueryResult, error) {
+func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query, sortSeries bool) (storage.SeriesSet, error) {
 	if c.got != nil {
 		return nil, fmt.Errorf("expected only one call to remote client got: %v", query)
 	}
@@ -211,7 +242,7 @@ func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query) (*prom
 
 	q := &prompb.QueryResult{}
 	for _, s := range c.store {
-		l := labelProtosToLabels(&c.b, s.Labels)
+		l := s.ToLabels(&c.b, nil)
 		var notMatch bool
 
 		for _, m := range matchers {
@@ -223,15 +254,69 @@ func (c *mockedRemoteClient) Read(_ context.Context, query *prompb.Query) (*prom
 			}
 		}
 
-		if !notMatch {
-			q.Timeseries = append(q.Timeseries, &prompb.TimeSeries{Labels: s.Labels})
+		if notMatch {
+			continue
 		}
+		// Filter samples by query time range
+		var filteredSamples []prompb.Sample
+		for _, sample := range s.Samples {
+			if sample.Timestamp >= query.StartTimestampMs && sample.Timestamp <= query.EndTimestampMs {
+				filteredSamples = append(filteredSamples, sample)
+			}
+		}
+		q.Timeseries = append(q.Timeseries, &prompb.TimeSeries{Labels: s.Labels, Samples: filteredSamples})
 	}
-	return q, nil
+	return FromQueryResult(sortSeries, q), nil
+}
+
+func (c *mockedRemoteClient) ReadMultiple(_ context.Context, queries []*prompb.Query, sortSeries bool) (storage.SeriesSet, error) {
+	// Store the queries for verification
+	c.gotMultiple = make([]*prompb.Query, len(queries))
+	copy(c.gotMultiple, queries)
+
+	// Simulate the same behavior as the real client
+	var results []*prompb.QueryResult
+	for _, query := range queries {
+		matchers, err := FromLabelMatchers(query.Matchers)
+		if err != nil {
+			return nil, err
+		}
+
+		q := &prompb.QueryResult{}
+		for _, s := range c.store {
+			l := s.ToLabels(&c.b, nil)
+			var notMatch bool
+
+			for _, m := range matchers {
+				v := l.Get(m.Name)
+				if !m.Matches(v) {
+					notMatch = true
+					break
+				}
+			}
+
+			if notMatch {
+				continue
+			}
+			// Filter samples by query time range
+			var filteredSamples []prompb.Sample
+			for _, sample := range s.Samples {
+				if sample.Timestamp >= query.StartTimestampMs && sample.Timestamp <= query.EndTimestampMs {
+					filteredSamples = append(filteredSamples, sample)
+				}
+			}
+			q.Timeseries = append(q.Timeseries, &prompb.TimeSeries{Labels: s.Labels, Samples: filteredSamples})
+		}
+		results = append(results, q)
+	}
+
+	// Use the same logic as the real client
+	return combineQueryResults(results, sortSeries)
 }
 
 func (c *mockedRemoteClient) reset() {
 	c.got = nil
+	c.gotMultiple = nil
 }
 
 // NOTE: We don't need to test ChunkQuerier as it's uses querier for all operations anyway.
@@ -474,9 +559,11 @@ func TestSampleAndChunkQueryableClient(t *testing.T) {
 			)
 			q, err := c.Querier(tc.mint, tc.maxt)
 			require.NoError(t, err)
-			defer require.NoError(t, q.Close())
+			defer func() {
+				require.NoError(t, q.Close())
+			}()
 
-			ss := q.Select(context.Background(), true, nil, tc.matchers...)
+			ss := q.Select(t.Context(), true, nil, tc.matchers...)
 			require.NoError(t, err)
 			require.Equal(t, annotations.Annotations(nil), ss.Warnings())
 
@@ -490,4 +577,76 @@ func TestSampleAndChunkQueryableClient(t *testing.T) {
 			testutil.RequireEqual(t, tc.expectedSeries, got)
 		})
 	}
+
+	t.Run("search warnings", func(t *testing.T) {
+		local := teststorage.New(t)
+		app := local.AppenderV2(t.Context())
+		lbls := labels.FromStrings("__name__", "up", "job", "prometheus")
+		ref, err := app.Append(0, lbls, 0, 1000, 1, nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+		_, err = app.Append(ref, lbls, 0, 1500, 1, nil, nil, storage.AOptions{})
+		require.NoError(t, err)
+		require.NoError(t, app.Commit())
+
+		for _, tc := range []struct {
+			name       string
+			mint, maxt int64
+			readRecent bool
+			warning    bool
+			empty      bool
+		}{
+			{name: "overlapping local history", mint: 0, maxt: 2000, warning: true},
+			{name: "before local history", mint: 0, maxt: 999, warning: true, empty: true},
+			{name: "local start boundary", mint: 1000, maxt: 2000, warning: true},
+			{name: "recent range excludes remote", mint: 1001, maxt: 2000},
+			{name: "read recent includes remote", mint: 1001, maxt: 2000, readRecent: true, warning: true},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				client := &mockedRemoteClient{}
+				remote := &Storage{queryables: []storage.SampleAndChunkQueryable{NewSampleAndChunkQueryableClient(
+					client, labels.EmptyLabels(), nil, tc.readRecent, func() (int64, error) { return 1000, nil },
+				)}}
+				primary, err := local.Querier(tc.mint, tc.maxt)
+				require.NoError(t, err)
+				secondary, err := remote.Querier(tc.mint, tc.maxt)
+				require.NoError(t, err)
+				q := storage.NewMergeQuerier([]storage.Querier{primary}, []storage.Querier{secondary}, storage.ChainedSeriesMerge)
+				defer func() { require.NoError(t, q.Close()) }()
+				searcher, ok := q.(storage.Searcher)
+				require.True(t, ok)
+				for _, method := range []struct {
+					name     string
+					search   func() storage.SearchResultSet
+					expected []string
+				}{
+					{"names", func() storage.SearchResultSet { return searcher.SearchLabelNames(t.Context(), nil) }, []string{"__name__", "job"}},
+					{"values", func() storage.SearchResultSet { return searcher.SearchLabelValues(t.Context(), "job", nil) }, []string{"prometheus"}},
+				} {
+					t.Run(method.name, func(t *testing.T) {
+						rs := method.search()
+						defer func() { require.NoError(t, rs.Close()) }()
+						var values []string
+						for rs.Next() {
+							values = append(values, rs.At().Value)
+						}
+						require.NoError(t, rs.Err())
+						if tc.empty {
+							require.Empty(t, values)
+						} else {
+							require.Equal(t, method.expected, values)
+						}
+						if tc.warning {
+							warnings := rs.Warnings().AsErrors()
+							require.Len(t, warnings, 1)
+							require.EqualError(t, warnings[0], "search is not supported by a secondary storage backend; results may be incomplete")
+						} else {
+							require.Empty(t, rs.Warnings())
+						}
+						require.Nil(t, client.got)
+						require.Empty(t, client.gotMultiple)
+					})
+				}
+			})
+		}
+	})
 }

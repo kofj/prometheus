@@ -1,4 +1,4 @@
-// Copyright 2014 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,8 +21,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 
+	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 )
@@ -38,6 +40,12 @@ func TestTemplateExpansion(t *testing.T) {
 			// Simple value.
 			text:   "{{ 1 }}",
 			output: "1",
+		},
+		{
+			// Native histogram value.
+			text:   "{{ . | value }}",
+			input:  &sample{Value: &histogram.FloatHistogram{Count: 3, Sum: 10}},
+			output: (&histogram.FloatHistogram{Count: 3, Sum: 10}).String(),
 		},
 		{
 			// Non-ASCII space (not allowed in text/template, see https://github.com/golang/go/blob/master/src/text/template/parse/lex.go#L98)
@@ -83,6 +91,18 @@ func TestTemplateExpansion(t *testing.T) {
 				},
 			},
 			output: "11",
+		},
+		{
+			// Get value of a native histogram from query.
+			text: "{{ query \"metric{instance='a'}\" | first | value }}",
+			queryResult: promql.Vector{
+				{
+					Metric: labels.FromStrings(labels.MetricName, "metric", "instance", "a"),
+					T:      0,
+					H:      &histogram.FloatHistogram{Count: 3, Sum: 10},
+				},
+			},
+			output: (&histogram.FloatHistogram{Count: 3, Sum: 10}).String(),
 		},
 		{
 			// Get label from query.
@@ -449,6 +469,31 @@ func TestTemplateExpansion(t *testing.T) {
 			output: "2015",
 		},
 		{
+			// toDuration - input as float64 seconds, returns *time.Duration.
+			text:   `{{ (1800 | toDuration).String }}`,
+			output: "30m0s",
+		},
+		{
+			// toDuration - input as string seconds, returns *time.Duration.
+			text:   `{{ ("1800" | toDuration).String }}`,
+			output: "30m0s",
+		},
+		{
+			// now - returns fixed timestamp as float64 seconds.
+			text:   `{{ now }}`,
+			output: "1.353755652e+09",
+		},
+		{
+			// now - returns fixed timestamp converted to formatted time string.
+			text:   `{{ (now | toTime).Format "Mon Jan 2 15:04:05 2006" }}`,
+			output: "Sat Nov 24 11:14:12 2012",
+		},
+		{
+			// returns Unix milliseconds timestamp for 30 minutes ago.
+			text:   `{{ ("-30m" | parseDuration | toDuration | (now | toTime).Add).UnixMilli }}`,
+			output: "1353753852000",
+		},
+		{
 			// Title.
 			text:   "{{ \"aa bb CC\" | title }}",
 			output: "Aa Bb CC",
@@ -495,9 +540,14 @@ func TestTemplateExpansion(t *testing.T) {
 			output: "http://testhost:9090/path/prefix",
 		},
 		{
-			// parseDuration (using printf to ensure the return is a string).
+			// parseDuration with positive duration (using printf to ensure the return is a string).
 			text:   "{{ printf \"%0.2f\" (parseDuration \"1h2m10ms\") }}",
 			output: "3720.01",
+		},
+		{
+			// parseDuration with negative duration (using printf to ensure the return is a string).
+			text:   "{{ printf \"%0.2f\" (parseDuration \"-1h2m10ms\") }}",
+			output: "-3720.01",
 		},
 		{
 			// Simple hostname.
@@ -534,13 +584,28 @@ func TestTemplateExpansion(t *testing.T) {
 			text:   "{{ \"[2001:0DB8::1]::12345\" | stripDomain }}",
 			output: "[2001:0DB8::1]::12345",
 		},
+		{
+			// IPv6 address with a zone identifier containing dots.
+			text:   "{{ \"fe80::1%eth0.100\" | stripDomain }}",
+			output: "fe80::1%eth0.100",
+		},
+		{
+			// IPv6 address with a zone identifier containing dots and a port.
+			text:   "{{ \"[fe80::1%eth0.100]:9090\" | stripDomain }}",
+			output: "[fe80::1%eth0.100]:9090",
+		},
+		{
+			// IPv4-mapped IPv6 address with a zone identifier containing dots.
+			text:   "{{ \"::ffff:192.0.2.1%eth0.100\" | stripDomain }}",
+			output: "::ffff:192.0.2.1%eth0.100",
+		},
 	})
 }
 
 type scenario struct {
 	text        string
 	output      string
-	input       interface{}
+	input       any
 	options     []string
 	queryResult promql.Vector
 	shouldFail  bool
@@ -555,12 +620,12 @@ func testTemplateExpansion(t *testing.T, scenarios []scenario) {
 	}
 
 	for _, s := range scenarios {
-		queryFunc := func(_ context.Context, _ string, _ time.Time) (promql.Vector, error) {
+		queryFunc := func(context.Context, string, time.Time) (promql.Vector, error) {
 			return s.queryResult, nil
 		}
 		var result string
 		var err error
-		expander := NewTemplateExpander(context.Background(), s.text, "test", s.input, 0, queryFunc, extURL, s.options)
+		expander := NewTemplateExpander(context.Background(), s.text, "test", s.input, model.Time(1353755652000), queryFunc, extURL, s.options)
 		if s.html {
 			result, err = expander.ExpandHTML(nil)
 		} else {

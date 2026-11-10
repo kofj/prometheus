@@ -1,4 +1,4 @@
-// Copyright 2015 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -132,6 +132,84 @@ var tests = []struct {
 			}, {
 				input:    "0x123",
 				expected: []Item{{NUMBER, 0, "0x123"}},
+			}, {
+				input: "1..2",
+				fail:  true,
+			}, {
+				input: "1.2.",
+				fail:  true,
+			}, {
+				input:    "00_1_23_4.56_7_8",
+				expected: []Item{{NUMBER, 0, "00_1_23_4.56_7_8"}},
+			}, {
+				input: "00_1_23__4.56_7_8",
+				fail:  true,
+			}, {
+				input: "00_1_23_4._56_7_8",
+				fail:  true,
+			}, {
+				input: "00_1_23_4_.56_7_8",
+				fail:  true,
+			}, {
+				input:    "0x1_2_34",
+				expected: []Item{{NUMBER, 0, "0x1_2_34"}},
+			}, {
+				input: "0x1_2__34",
+				fail:  true,
+			}, {
+				input: "0x1_2__34.5_6p1", // "0x1.1p1"-based formats are not supported yet.
+				fail:  true,
+			}, {
+				input: "0x1_2__34.5_6",
+				fail:  true,
+			}, {
+				input: "0x1_2__34.56",
+				fail:  true,
+			}, {
+				input: "1_e2",
+				fail:  true,
+			}, {
+				input:    "1.e2",
+				expected: []Item{{NUMBER, 0, "1.e2"}},
+			}, {
+				input: "1e.2",
+				fail:  true,
+			}, {
+				input: "1e+.2",
+				fail:  true,
+			}, {
+				input: "1ee2",
+				fail:  true,
+			}, {
+				input: "1e+e2",
+				fail:  true,
+			}, {
+				input: "1e",
+				fail:  true,
+			}, {
+				input: "1e+",
+				fail:  true,
+			}, {
+				input:    "1e1_2_34",
+				expected: []Item{{NUMBER, 0, "1e1_2_34"}},
+			}, {
+				input: "1e_1_2_34",
+				fail:  true,
+			}, {
+				input: "1e1_2__34",
+				fail:  true,
+			}, {
+				input: "1e+_1_2_34",
+				fail:  true,
+			}, {
+				input: "1e-_1_2_34",
+				fail:  true,
+			}, {
+				input: "12_",
+				fail:  true,
+			}, {
+				input:    "_1_2",
+				expected: []Item{{IDENTIFIER, 0, "_1_2"}},
 			},
 		},
 	},
@@ -353,6 +431,18 @@ var tests = []struct {
 				input:    "atan2",
 				expected: []Item{{ATAN2, 0, "atan2"}},
 			},
+			{
+				input:    "bitand",
+				expected: []Item{{BITAND, 0, "bitand"}},
+			},
+			{
+				input:    "bitor",
+				expected: []Item{{BITOR, 0, "bitor"}},
+			},
+			{
+				input:    "bitxor",
+				expected: []Item{{BITXOR, 0, "bitxor"}},
+			},
 		},
 	},
 	{
@@ -372,11 +462,17 @@ var tests = []struct {
 		name: "selectors",
 		tests: []testCase{
 			{
-				input: `台北`,
-				fail:  true,
+				input:    `台北`,
+				expected: []Item{{IDENTIFIER, 0, `台北`}},
 			}, {
 				input: `{台北='a'}`,
-				fail:  true,
+				expected: []Item{
+					{LEFT_BRACE, 0, `{`},
+					{IDENTIFIER, 1, `台北`},
+					{EQL, 7, `=`},
+					{STRING, 8, `'a'`},
+					{RIGHT_BRACE, 11, `}`},
+				},
 			}, {
 				input: `{0a='a'}`,
 				fail:  true,
@@ -561,6 +657,94 @@ var tests = []struct {
 				},
 				seriesDesc: true,
 			},
+			{
+				input: `{} {{buckets: [Inf NaN] schema:1}}`,
+				expected: []Item{
+					{LEFT_BRACE, 0, `{`},
+					{RIGHT_BRACE, 1, `}`},
+					{SPACE, 2, ` `},
+					{OPEN_HIST, 3, `{{`},
+					{BUCKETS_DESC, 5, `buckets`},
+					{COLON, 12, `:`},
+					{SPACE, 13, ` `},
+					{LEFT_BRACKET, 14, `[`},
+					{NUMBER, 15, `Inf`},
+					{SPACE, 18, ` `},
+					{NUMBER, 19, `NaN`},
+					{RIGHT_BRACKET, 22, `]`},
+					{SPACE, 23, ` `},
+					{SCHEMA_DESC, 24, `schema`},
+					{COLON, 30, `:`},
+					{NUMBER, 31, `1`},
+					{CLOSE_HIST, 32, `}}`},
+				},
+				seriesDesc: true,
+			},
+			{ // Series with sum as -Inf and count as NaN.
+				input: `{} {{buckets: [5 10 7] sum:Inf count:NaN}}`,
+				expected: []Item{
+					{LEFT_BRACE, 0, `{`},
+					{RIGHT_BRACE, 1, `}`},
+					{SPACE, 2, ` `},
+					{OPEN_HIST, 3, `{{`},
+					{BUCKETS_DESC, 5, `buckets`},
+					{COLON, 12, `:`},
+					{SPACE, 13, ` `},
+					{LEFT_BRACKET, 14, `[`},
+					{NUMBER, 15, `5`},
+					{SPACE, 16, ` `},
+					{NUMBER, 17, `10`},
+					{SPACE, 19, ` `},
+					{NUMBER, 20, `7`},
+					{RIGHT_BRACKET, 21, `]`},
+					{SPACE, 22, ` `},
+					{SUM_DESC, 23, `sum`},
+					{COLON, 26, `:`},
+					{NUMBER, 27, `Inf`},
+					{SPACE, 30, ` `},
+					{COUNT_DESC, 31, `count`},
+					{COLON, 36, `:`},
+					{NUMBER, 37, `NaN`},
+					{CLOSE_HIST, 40, `}}`},
+				},
+				seriesDesc: true,
+			},
+			{
+				input: `{} {{sum:1}}+{{sum:0}}x2 {{sum:1}}+{{sum:0}}x3`,
+				expected: []Item{
+					{LEFT_BRACE, 0, `{`},
+					{RIGHT_BRACE, 1, `}`},
+					{SPACE, 2, ` `},
+					{OPEN_HIST, 3, `{{`},
+					{SUM_DESC, 5, `sum`},
+					{COLON, 8, `:`},
+					{NUMBER, 9, `1`},
+					{CLOSE_HIST, 10, `}}`},
+					{ADD, 12, `+`},
+					{OPEN_HIST, 13, `{{`},
+					{SUM_DESC, 15, `sum`},
+					{COLON, 18, `:`},
+					{NUMBER, 19, `0`},
+					{CLOSE_HIST, 20, `}}`},
+					{TIMES, 22, `x`},
+					{NUMBER, 23, `2`},
+					{SPACE, 24, ` `},
+					{OPEN_HIST, 25, `{{`},
+					{SUM_DESC, 27, `sum`},
+					{COLON, 30, `:`},
+					{NUMBER, 31, `1`},
+					{CLOSE_HIST, 32, `}}`},
+					{ADD, 34, `+`},
+					{OPEN_HIST, 35, `{{`},
+					{SUM_DESC, 37, `sum`},
+					{COLON, 40, `:`},
+					{NUMBER, 41, `0`},
+					{CLOSE_HIST, 42, `}}`},
+					{TIMES, 44, `x`},
+					{NUMBER, 45, `3`},
+				},
+				seriesDesc: true,
+			},
 		},
 	},
 	{
@@ -614,6 +798,39 @@ var tests = []struct {
 	{
 		name: "subqueries",
 		tests: []testCase{
+			{
+				input: `rate(foo[5m])[:1s]`,
+				fail:  true,
+			},
+			{
+				input: `rate(foo[step()])[:1s]`,
+				fail:  true,
+			},
+			{
+				input: `foo[range():1s]`,
+				expected: []Item{
+					{IDENTIFIER, 0, `foo`},
+					{LEFT_BRACKET, 3, `[`},
+					{RANGE, 4, `range`},
+					{LEFT_PAREN, 9, `(`},
+					{RIGHT_PAREN, 10, `)`},
+					{COLON, 11, `:`},
+					{DURATION, 12, `1s`},
+					{RIGHT_BRACKET, 14, `]`},
+				},
+			},
+			{
+				input: `foo[step():]`,
+				expected: []Item{
+					{IDENTIFIER, 0, `foo`},
+					{LEFT_BRACKET, 3, `[`},
+					{STEP, 4, `step`},
+					{LEFT_PAREN, 8, `(`},
+					{RIGHT_PAREN, 9, `)`},
+					{COLON, 10, `:`},
+					{RIGHT_BRACKET, 11, `]`},
+				},
+			},
 			{
 				input: `test_name{on!~"bar"}[4m:4s]`,
 				expected: []Item{
@@ -783,6 +1000,10 @@ var tests = []struct {
 			},
 			{
 				input: `test:name{on!~"bar"}[:4s]`,
+				fail:  true,
+			},
+			{
+				input: `test:name{on!~"bar"}[1s:1s:1s]`,
 				fail:  true,
 			},
 		},

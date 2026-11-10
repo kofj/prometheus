@@ -20,6 +20,106 @@ import { ValueType } from '../types';
 describe('promql operations', () => {
   const testCases = [
     {
+      expr: ':node_memory_MemAvailable_bytes',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'sum by (a:b) (:温度)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo + on (a:b) group_left (:label) bar',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo{service.name="api"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'sum by (service.name, équipe) (rate(http.server.requests[5m]))',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: '温度{場所="東京"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: '𐐀{𐐀="x"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'requests_total + on (service.name) group_left (équipe) service_info',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo > bool.5',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'topK',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'Inf.total + Inf',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: '5 bitand 3',
+      expectedValueType: ValueType.scalar,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitand 64',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitand on(instance) group_left(model) mask',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: '5 bitor 3',
+      expectedValueType: ValueType.scalar,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitor 64',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitor on(instance) group_left(model) mask',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: '5 bitxor 3',
+      expectedValueType: ValueType.scalar,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitxor 64',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'status bitxor on(instance) group_left(model) mask',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
       expr: '1',
       expectedValueType: ValueType.scalar,
       expectedDiag: [] as Diagnostic[],
@@ -86,6 +186,65 @@ describe('promql operations', () => {
       expectedDiag: [] as Diagnostic[],
     },
     {
+      expr: 'some_metric[1h:range()]',
+      expectedValueType: ValueType.matrix,
+      expectedDiag: [
+        {
+          from: 15,
+          to: 22,
+          message: 'range() is not meaningful as a subquery resolution step; consider a concrete duration',
+          severity: 'warning',
+        },
+      ] as Diagnostic[],
+    },
+    {
+      // Colon inside a label value must not be mistaken for the subquery colon.
+      expr: 'some_metric{job=~"a:b"}[1h:range()]',
+      expectedValueType: ValueType.matrix,
+      expectedDiag: [
+        {
+          // Warning span is the step `DurationExpr` (`range()`), i.e. doc[27:34] in this string.
+          from: 27,
+          to: 34,
+          message: 'range() is not meaningful as a subquery resolution step; consider a concrete duration',
+          severity: 'warning',
+        },
+      ] as Diagnostic[],
+    },
+    {
+      // Nested duration in the subquery step: two direct `DurationExpr` children; step is not `range()`.
+      expr: 'some_metric[1h:min_of(step(), 1m)]',
+      expectedValueType: ValueType.matrix,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      // range() nested inside min_of is a bounded operand, not the top-level step expression,
+      // so it must not trigger the resolution-step warning.
+      expr: 'some_metric[1h:min_of(range(), 5m)]',
+      expectedValueType: ValueType.matrix,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo offset step()',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo offset range()',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo offset (1h / 2)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo offset ((2 ^ 3) * 1m)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
       expr: 'sum(metric_name offset 1m)',
       expectedValueType: ValueType.vector,
       expectedDiag: [] as Diagnostic[],
@@ -102,6 +261,21 @@ describe('promql operations', () => {
     },
     {
       expr: 'max_over_time(rate(metric_name[5m])[1h:] offset 1m)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'ts_of_max_over_time(rate(metric_name[5m])[1h:] offset 1m)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'ts_of_min_over_time(rate(metric_name[5m])[1h:] offset 1m)',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'ts_of_last_over_time(rate(metric_name[5m])[1h:] offset 1m)',
       expectedValueType: ValueType.vector,
       expectedDiag: [] as Diagnostic[],
     },
@@ -205,12 +379,22 @@ describe('promql operations', () => {
       expectedDiag: [] as Diagnostic[],
     },
     {
+      expr: 'foo and on(test,"blub") bar',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
       expr: 'foo and on() bar',
       expectedValueType: ValueType.vector,
       expectedDiag: [] as Diagnostic[],
     },
     {
       expr: 'foo and ignoring(test,blub) bar',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo and ignoring(test,"blub") bar',
       expectedValueType: ValueType.vector,
       expectedDiag: [] as Diagnostic[],
     },
@@ -226,6 +410,11 @@ describe('promql operations', () => {
     },
     {
       expr: 'foo / on(test,blub) group_left(bar) bar',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [] as Diagnostic[],
+    },
+    {
+      expr: 'foo / on(test,blub) group_left("bar") bar',
       expectedValueType: ValueType.vector,
       expectedDiag: [] as Diagnostic[],
     },
@@ -513,7 +702,7 @@ describe('promql operations', () => {
         },
       ],
     },
-    // test aggregration
+    // test aggregation
     {
       expr: 'sum by (foo)(some_metric)',
       expectedValueType: ValueType.vector,
@@ -610,6 +799,41 @@ describe('promql operations', () => {
     {
       expr: 'rate(some_metric[5m])',
       expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'rate(some_metric[1h + 30m])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'rate(some_metric[(5 + 2) * 1m])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'rate(some_metric[4h % 3h])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'rate(some_metric[step()])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'rate(some_metric[min_of(5m, range())])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'avg_over_time(metric[max_of(step(), 1m)])',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'some_metric[1h:step()]',
+      expectedValueType: ValueType.matrix,
       expectedDiag: [],
     },
     {
@@ -825,6 +1049,151 @@ describe('promql operations', () => {
       expectedValueType: ValueType.vector,
       expectedDiag: [],
     },
+    {
+      expr: '{"foo"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      // with metric name in the middle
+      expr: '{a="b","foo",c~="d"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"foo", a="bc"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"colon:in:the:middle"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"dot.in.the.middle"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"😀 in metric name"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      // quotes with escape
+      expr: '{"this is \"foo\" metric"}', // eslint-disable-line
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"foo","colon:in:the:middle"="val"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"foo","dot.in.the.middle"="val"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{"foo","😀 in label name"="val"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      // quotes with escape
+      expr: '{"foo","this is \"bar\" label"="val"}', // eslint-disable-line
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'foo{"bar"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          message: 'metric name must not be set twice: foo or bar',
+          severity: 'error',
+          to: 10,
+        },
+      ],
+    },
+    {
+      expr: '{"foo", __name__="bar"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          message: 'metric name must not be set twice: foo or bar',
+          severity: 'error',
+          to: 23,
+        },
+      ],
+    },
+    {
+      expr: '{"foo", "__name__"="bar"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          message: 'metric name must not be set twice: foo or bar',
+          severity: 'error',
+          to: 25,
+        },
+      ],
+    },
+    {
+      expr: '{"__name__"="foo", __name__="bar"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          message: 'metric name must not be set twice: foo or bar',
+          severity: 'error',
+          to: 34,
+        },
+      ],
+    },
+    {
+      expr: '{"foo", "bar"}',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          to: 14,
+          message: 'metric name must not be set twice: foo or bar',
+          severity: 'error',
+        },
+      ],
+    },
+    {
+      expr: `{'foo\`metric':'bar'}`,
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: '{`foo\"metric`=`bar`}', // eslint-disable-line
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'info(rate(http_request_counter_total{}[5m]))',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [],
+    },
+    {
+      expr: 'info(rate(http_request_counter_total[5m]), target_info{service_version=~".+"})',
+      expectedValueType: ValueType.vector,
+      expectedDiag: [
+        {
+          from: 0,
+          to: 78,
+          message: `expected label selectors as the second argument to "info" function, got [object Object]`,
+          severity: 'error',
+        },
+      ],
+    },
   ];
   testCases.forEach((value) => {
     const state = createEditorState(value.expr);
@@ -832,6 +1201,30 @@ describe('promql operations', () => {
     it(value.expr, () => {
       expect(parser.checkAST(syntaxTree(state).topNode.firstChild)).toEqual(value.expectedValueType);
       expect(parser.getDiagnostics()).toEqual(value.expectedDiag);
+    });
+  });
+
+  describe('analyze()', () => {
+    it('does not duplicate invalid-offset diagnostics when the offset is not at EOF', () => {
+      const state = createEditorState('foo offset abc * 2');
+      const parser = new Parser(state);
+      parser.analyze();
+      const diags = parser.getDiagnostics();
+      expect(diags).toHaveLength(1);
+      expect(diags[0].message).toBe('offset requires a duration expression');
+      expect(diags[0].from).toBe(0);
+      expect(diags[0].to).toBe(15);
+    });
+
+    it('still reports a single targeted offset diagnostic with trailing document space (editor-like)', () => {
+      const state = createEditorState('foo offset abc   ');
+      const parser = new Parser(state);
+      parser.analyze();
+      const diags = parser.getDiagnostics();
+      expect(diags).toHaveLength(1);
+      expect(diags[0].message).toBe('offset requires a duration expression');
+      expect(diags[0].from).toBe(0);
+      expect(diags[0].to).toBe(17);
     });
   });
 });

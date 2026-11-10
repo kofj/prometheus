@@ -1,4 +1,4 @@
-// Copyright 2015 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,8 +14,11 @@
 package parser
 
 import (
+	"bytes"
 	"fmt"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,15 +38,16 @@ func tree(node Node, level string) string {
 	}
 	typs := strings.Split(fmt.Sprintf("%T", node), ".")[1]
 
-	t := fmt.Sprintf("%s |---- %s :: %s\n", level, typs, node)
+	var t strings.Builder
+	fmt.Fprintf(&t, "%s |---- %s :: %s\n", level, typs, node)
 
 	level += " · · ·"
 
-	for _, e := range Children(node) {
-		t += tree(e, level)
+	for e := range ChildrenIter(node) {
+		t.WriteString(tree(e, level))
 	}
 
-	return t
+	return t.String()
 }
 
 func (node *EvalStmt) String() string {
@@ -51,80 +55,268 @@ func (node *EvalStmt) String() string {
 }
 
 func (es Expressions) String() (s string) {
-	if len(es) == 0 {
+	switch len(es) {
+	case 0:
 		return ""
+	case 1:
+		return es[0].String()
 	}
-	for _, e := range es {
-		s += e.String()
-		s += ", "
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	b.WriteString(es[0].String())
+	for _, e := range es[1:] {
+		b.WriteString(", ")
+		b.WriteString(e.String())
 	}
-	return s[:len(s)-2]
+	return b.String()
 }
 
 func (node *AggregateExpr) String() string {
-	aggrString := node.getAggOpStr()
-	aggrString += "("
-	if node.Op.IsAggregatorWithParam() {
-		aggrString += fmt.Sprintf("%s, ", node.Param)
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	node.writeAggOpStr(b)
+	b.WriteString("(")
+	// A failed parse (e.g. missing or too few arguments) can leave Param or Expr nil.
+	// Print only the parts that were parsed.
+	if node.Op.IsAggregatorWithParam() && node.Param != nil {
+		b.WriteString(node.Param.String())
+		if node.Expr != nil {
+			b.WriteString(", ")
+		}
 	}
-	aggrString += fmt.Sprintf("%s)", node.Expr)
+	if node.Expr != nil {
+		b.WriteString(node.Expr.String())
+	}
+	b.WriteString(")")
 
-	return aggrString
+	return b.String()
 }
 
-func (node *AggregateExpr) getAggOpStr() string {
-	aggrString := node.Op.String()
+func (node *AggregateExpr) ShortString() string {
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	node.writeAggOpStr(b)
+	return b.String()
+}
+
+func (node *AggregateExpr) writeAggOpStr(b *bytes.Buffer) {
+	b.WriteString(node.Op.String())
 
 	switch {
 	case node.Without:
-		aggrString += fmt.Sprintf(" without (%s) ", strings.Join(node.Grouping, ", "))
+		b.WriteString(" without (")
+		writeLabels(b, node.Grouping, node.unquotedUTF8Names)
+		b.WriteString(") ")
 	case len(node.Grouping) > 0:
-		aggrString += fmt.Sprintf(" by (%s) ", strings.Join(node.Grouping, ", "))
+		b.WriteString(" by (")
+		writeLabels(b, node.Grouping, node.unquotedUTF8Names)
+		b.WriteString(") ")
 	}
+}
 
-	return aggrString
+func writeLabels(b *bytes.Buffer, ss []string, unquotedUTF8Names bool) {
+	for i, s := range ss {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		if labelNameRequiresQuoting(s, unquotedUTF8Names) {
+			b.Write(strconv.AppendQuote(b.AvailableBuffer(), s))
+		} else {
+			b.WriteString(s)
+		}
+	}
+}
+
+func labelNameRequiresQuoting(s string, unquotedUTF8Names bool) bool {
+	if !unquotedUTF8Names {
+		return !model.LegacyValidation.IsValidLabelName(s)
+	}
+	if s == "" {
+		return true
+	}
+	for i, r := range s {
+		if (i == 0 && !isNameStart(r)) || (i > 0 && !isNameContinue(r)) {
+			return true
+		}
+	}
+	return false
+}
+
+// writeStringsJoin is like strings.Join but appending to a bytes.Buffer.
+func writeStringsJoin(b *bytes.Buffer, elems []string, sep string) {
+	if len(elems) == 0 {
+		return
+	}
+	b.WriteString(elems[0])
+	for _, s := range elems[1:] {
+		b.WriteString(sep)
+		b.WriteString(s)
+	}
+}
+
+func (node *BinaryExpr) returnBool() string {
+	if node.ReturnBool {
+		return " bool"
+	}
+	return ""
 }
 
 func (node *BinaryExpr) String() string {
-	returnBool := ""
-	if node.ReturnBool {
-		returnBool = " bool"
-	}
-
 	matching := node.getMatchingStr()
-	return fmt.Sprintf("%s %s%s%s %s", node.LHS, node.Op, returnBool, matching, node.RHS)
+	return node.lhs().String() + " " + node.Op.String() + node.returnBool() + matching + " " + node.RHS.String()
+}
+
+// lhs returns the left operand to print, in parentheses if it is the base of
+// ^ and prints with a leading sign. ^ binds tighter than a unary sign, so a
+// bare +Inf ^ 2 or -x ^ 2 would parse back as the sign applied to the power.
+func (node *BinaryExpr) lhs() Expr {
+	if node.Op == POW && printsWithSign(node.LHS) {
+		return &ParenExpr{Expr: node.LHS}
+	}
+	return node.LHS
+}
+
+// printsWithSign reports whether e's String() may start with + or -. It errs
+// towards true: a NaN or a zero duration with the sign bit set gets harmless
+// parentheses.
+func printsWithSign(e Expr) bool {
+	switch e := e.(type) {
+	case *NumberLiteral:
+		return math.Signbit(e.Val) || math.IsInf(e.Val, 1)
+	case *UnaryExpr:
+		return true
+	case *StepInvariantExpr:
+		return printsWithSign(e.Expr)
+	}
+	return false
+}
+
+func (node *BinaryExpr) ShortString() string {
+	return node.Op.String() + node.returnBool() + node.getMatchingStr()
 }
 
 func (node *BinaryExpr) getMatchingStr() string {
 	matching := ""
+	var b bytes.Buffer
 	vm := node.VectorMatching
-	if vm != nil && (len(vm.MatchingLabels) > 0 || vm.On) {
-		vmTag := "ignoring"
-		if vm.On {
-			vmTag = "on"
+	if vm != nil {
+		if len(vm.MatchingLabels) > 0 || vm.On || vm.Card == CardManyToOne || vm.Card == CardOneToMany {
+			vmTag := "ignoring"
+			if vm.On {
+				vmTag = "on"
+			}
+			b.WriteString(" " + vmTag + " (")
+			writeLabels(&b, vm.MatchingLabels, node.unquotedUTF8Names)
+			b.WriteString(")")
+			matching = b.String()
 		}
-		matching = fmt.Sprintf(" %s (%s)", vmTag, strings.Join(vm.MatchingLabels, ", "))
 
 		if vm.Card == CardManyToOne || vm.Card == CardOneToMany {
 			vmCard := "right"
 			if vm.Card == CardManyToOne {
 				vmCard = "left"
 			}
-			matching += fmt.Sprintf(" group_%s (%s)", vmCard, strings.Join(vm.Include, ", "))
+			b.Reset()
+			b.WriteString(" group_" + vmCard + " (")
+			writeLabels(&b, vm.Include, node.unquotedUTF8Names)
+			b.WriteString(")")
+			matching += b.String()
+		}
+
+		if vm.FillValues.LHS != nil || vm.FillValues.RHS != nil {
+			if vm.FillValues.LHS != nil && vm.FillValues.RHS != nil && *vm.FillValues.LHS == *vm.FillValues.RHS {
+				matching += fmt.Sprintf(" fill (%v)", *vm.FillValues.LHS)
+			} else {
+				if vm.FillValues.LHS != nil {
+					matching += fmt.Sprintf(" fill_left (%v)", *vm.FillValues.LHS)
+				}
+				if vm.FillValues.RHS != nil {
+					matching += fmt.Sprintf(" fill_right (%v)", *vm.FillValues.RHS)
+				}
+			}
 		}
 	}
 	return matching
 }
 
-func (node *Call) String() string {
-	return fmt.Sprintf("%s(%s)", node.Func.Name, node.Args)
+func (node *DurationExpr) String() string {
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	node.writeTo(b)
+	return b.String()
 }
 
-func (node *MatrixSelector) String() string {
-	// Copy the Vector selector before changing the offset
-	vecSelector := *node.VectorSelector.(*VectorSelector)
+func (node *DurationExpr) writeTo(b *bytes.Buffer) {
+	if node.Wrapped {
+		b.WriteByte('(')
+	}
+
+	switch {
+	case node.Op == STEP:
+		b.WriteString("step()")
+	case node.Op == RANGE:
+		b.WriteString("range()")
+	case node.Op == MIN_OF:
+		b.WriteString("min_of(")
+		b.WriteString(node.LHS.String())
+		b.WriteString(", ")
+		b.WriteString(node.RHS.String())
+		b.WriteByte(')')
+	case node.Op == MAX_OF:
+		b.WriteString("max_of(")
+		b.WriteString(node.LHS.String())
+		b.WriteString(", ")
+		b.WriteString(node.RHS.String())
+		b.WriteByte(')')
+	case node.LHS == nil:
+		// This is a unary duration expression.
+		switch node.Op {
+		case SUB:
+			b.WriteString(node.Op.String())
+			b.WriteString(node.RHS.String())
+		case ADD:
+			b.WriteString(node.RHS.String())
+		default:
+			// This should never happen.
+			panic(fmt.Sprintf("unexpected unary duration expression: %s", node.Op))
+		}
+	default:
+		b.WriteString(node.LHS.String())
+		b.WriteByte(' ')
+		b.WriteString(node.Op.String())
+		b.WriteByte(' ')
+		b.WriteString(node.RHS.String())
+	}
+
+	if node.Wrapped {
+		b.WriteByte(')')
+	}
+}
+
+func (node *DurationExpr) ShortString() string {
+	return node.Op.String()
+}
+
+func (node *Call) String() string {
+	return node.ShortString() + "(" + node.Args.String() + ")"
+}
+
+func (node *Call) ShortString() string {
+	// A failed parse leaves Func nil for an unknown function name, and the AST does
+	// not keep the name itself, so there is nothing to print for it.
+	if node.Func == nil {
+		return ""
+	}
+	return node.Func.Name
+}
+
+func (node *MatrixSelector) atOffset() (string, string) {
+	vecSelector, ok := node.VectorSelector.(*VectorSelector)
+	if !ok {
+		// A failed parse can leave a non-vector expression here (e.g. `1[5m]`). Such an
+		// operand cannot carry @ or offset modifiers, so there is nothing to print.
+		return "", ""
+	}
 	offset := ""
 	switch {
+	case vecSelector.OriginalOffsetExpr != nil:
+		offset = fmt.Sprintf(" offset %s", vecSelector.OriginalOffsetExpr)
 	case vecSelector.OriginalOffset > time.Duration(0):
 		offset = fmt.Sprintf(" offset %s", model.Duration(vecSelector.OriginalOffset))
 	case vecSelector.OriginalOffset < time.Duration(0):
@@ -139,32 +331,77 @@ func (node *MatrixSelector) String() string {
 	case vecSelector.StartOrEnd == END:
 		at = " @ end()"
 	}
+	return at, offset
+}
 
-	// Do not print the @ and offset twice.
-	offsetVal, atVal, preproc := vecSelector.OriginalOffset, vecSelector.Timestamp, vecSelector.StartOrEnd
+func (node *MatrixSelector) String() string {
+	rangeStr := model.Duration(node.Range).String()
+	if node.RangeExpr != nil {
+		rangeStr = node.RangeExpr.String()
+	}
+	vs, ok := node.VectorSelector.(*VectorSelector)
+	if !ok {
+		// A failed parse can leave a non-vector expression here (e.g. `1[5m]`), and a
+		// hand-built node may have no operand at all. Neither can carry the selector-only
+		// modifiers handled below, so print whatever is there with the range.
+		inner := ""
+		if node.VectorSelector != nil {
+			inner = node.VectorSelector.String()
+		}
+		return fmt.Sprintf("%s[%s]", inner, rangeStr)
+	}
+	at, offset := node.atOffset()
+	// Copy the Vector selector so we can modify it to not print @, offset, and other modifiers twice.
+	vecSelector := *vs
+	anchored, smoothed := vecSelector.Anchored, vecSelector.Smoothed
 	vecSelector.OriginalOffset = 0
+	vecSelector.OriginalOffsetExpr = nil
 	vecSelector.Timestamp = nil
 	vecSelector.StartOrEnd = 0
+	vecSelector.Anchored = false
+	vecSelector.Smoothed = false
 
-	str := fmt.Sprintf("%s[%s]%s%s", vecSelector.String(), model.Duration(node.Range), at, offset)
-
-	vecSelector.OriginalOffset, vecSelector.Timestamp, vecSelector.StartOrEnd = offsetVal, atVal, preproc
+	extendedAttribute := ""
+	switch {
+	case anchored:
+		extendedAttribute = " anchored"
+	case smoothed:
+		extendedAttribute = " smoothed"
+	}
+	str := fmt.Sprintf("%s[%s]%s%s%s", vecSelector.String(), rangeStr, extendedAttribute, at, offset)
 
 	return str
+}
+
+func (node *MatrixSelector) ShortString() string {
+	at, offset := node.atOffset()
+	rangeStr := model.Duration(node.Range).String()
+	if node.RangeExpr != nil {
+		rangeStr = node.RangeExpr.String()
+	}
+	return fmt.Sprintf("[%s]%s%s", rangeStr, at, offset)
 }
 
 func (node *SubqueryExpr) String() string {
 	return fmt.Sprintf("%s%s", node.Expr.String(), node.getSubqueryTimeSuffix())
 }
 
+func (node *SubqueryExpr) ShortString() string {
+	return node.getSubqueryTimeSuffix()
+}
+
 // getSubqueryTimeSuffix returns the '[<range>:<step>] @ <timestamp> offset <offset>' suffix of the subquery.
 func (node *SubqueryExpr) getSubqueryTimeSuffix() string {
 	step := ""
-	if node.Step != 0 {
+	if node.StepExpr != nil {
+		step = node.StepExpr.String()
+	} else if node.Step != 0 {
 		step = model.Duration(node.Step).String()
 	}
 	offset := ""
 	switch {
+	case node.OriginalOffsetExpr != nil:
+		offset = fmt.Sprintf(" offset %s", node.OriginalOffsetExpr)
 	case node.OriginalOffset > time.Duration(0):
 		offset = fmt.Sprintf(" offset %s", model.Duration(node.OriginalOffset))
 	case node.OriginalOffset < time.Duration(0):
@@ -179,23 +416,36 @@ func (node *SubqueryExpr) getSubqueryTimeSuffix() string {
 	case node.StartOrEnd == END:
 		at = " @ end()"
 	}
-	return fmt.Sprintf("[%s:%s]%s%s", model.Duration(node.Range), step, at, offset)
+	rangeStr := model.Duration(node.Range).String()
+	if node.RangeExpr != nil {
+		rangeStr = node.RangeExpr.String()
+	}
+	return fmt.Sprintf("[%s:%s]%s%s", rangeStr, step, at, offset)
 }
 
 func (node *NumberLiteral) String() string {
-	return fmt.Sprint(node.Val)
+	if node.Duration {
+		// Round to whole milliseconds: Val is float64 seconds, so 1.001 is
+		// stored as 1.000999... and truncating would print (1s1ms) as (1s).
+		return (model.Duration(math.Round(node.Val*1000)) * model.Duration(time.Millisecond)).String()
+	}
+	return strconv.FormatFloat(node.Val, 'f', -1, 64)
 }
 
 func (node *ParenExpr) String() string {
-	return fmt.Sprintf("(%s)", node.Expr)
+	return "(" + node.Expr.String() + ")"
 }
 
 func (node *StringLiteral) String() string {
-	return fmt.Sprintf("%q", node.Val)
+	return strconv.Quote(node.Val)
 }
 
 func (node *UnaryExpr) String() string {
-	return fmt.Sprintf("%s%s", node.Op, node.Expr)
+	return node.Op.String() + node.Expr.String()
+}
+
+func (node *UnaryExpr) ShortString() string {
+	return node.Op.String()
 }
 
 func (node *VectorSelector) String() string {
@@ -204,32 +454,59 @@ func (node *VectorSelector) String() string {
 		labelStrings = make([]string, 0, len(node.LabelMatchers)-1)
 	}
 	for _, matcher := range node.LabelMatchers {
-		// Only include the __name__ label if its equality matching and matches the name.
-		if matcher.Name == labels.MetricName && matcher.Type == labels.MatchEqual && matcher.Value == node.Name {
+		// A partially-built AST from a failed parse, or a hand-constructed selector, may
+		// hold a nil matcher. Skip it so printing never panics.
+		if matcher == nil {
 			continue
 		}
-		labelStrings = append(labelStrings, matcher.String())
+		// Only include the __name__ label if its equality matching and matches the name, but don't skip if it's an explicit empty name matcher.
+		if matcher.Name == labels.MetricName && matcher.Type == labels.MatchEqual && matcher.Value == node.Name && matcher.Value != "" {
+			continue
+		}
+		if !labelNameRequiresQuoting(matcher.Name, node.unquotedUTF8Names) {
+			labelStrings = append(labelStrings, matcher.Name+matcher.Type.String()+strconv.Quote(matcher.Value))
+		} else {
+			labelStrings = append(labelStrings, matcher.String())
+		}
 	}
-	offset := ""
-	switch {
-	case node.OriginalOffset > time.Duration(0):
-		offset = fmt.Sprintf(" offset %s", model.Duration(node.OriginalOffset))
-	case node.OriginalOffset < time.Duration(0):
-		offset = fmt.Sprintf(" offset -%s", model.Duration(-node.OriginalOffset))
+	b := bytes.NewBuffer(make([]byte, 0, 1024))
+	name := node.Name
+	if name != "" && !node.unquotedUTF8Names && !model.LegacyValidation.IsValidMetricName(name) {
+		labelStrings = append(labelStrings, labels.MetricName+"="+strconv.Quote(name))
+		name = ""
 	}
-	at := ""
+	b.WriteString(name)
+	if len(labelStrings) != 0 {
+		b.WriteByte('{')
+		sort.Strings(labelStrings)
+		writeStringsJoin(b, labelStrings, ",")
+		b.WriteByte('}')
+	}
 	switch {
 	case node.Timestamp != nil:
-		at = fmt.Sprintf(" @ %.3f", float64(*node.Timestamp)/1000.0)
+		b.WriteString(" @ ")
+		b.Write(strconv.AppendFloat(b.AvailableBuffer(), float64(*node.Timestamp)/1000.0, 'f', 3, 64))
 	case node.StartOrEnd == START:
-		at = " @ start()"
+		b.WriteString(" @ start()")
 	case node.StartOrEnd == END:
-		at = " @ end()"
+		b.WriteString(" @ end()")
 	}
-
-	if len(labelStrings) == 0 {
-		return fmt.Sprintf("%s%s%s", node.Name, at, offset)
+	switch {
+	case node.Anchored:
+		b.WriteString(" anchored")
+	case node.Smoothed:
+		b.WriteString(" smoothed")
 	}
-	sort.Strings(labelStrings)
-	return fmt.Sprintf("%s{%s}%s%s", node.Name, strings.Join(labelStrings, ","), at, offset)
+	switch {
+	case node.OriginalOffsetExpr != nil:
+		b.WriteString(" offset ")
+		node.OriginalOffsetExpr.writeTo(b)
+	case node.OriginalOffset > time.Duration(0):
+		b.WriteString(" offset ")
+		b.WriteString(model.Duration(node.OriginalOffset).String())
+	case node.OriginalOffset < time.Duration(0):
+		b.WriteString(" offset -")
+		b.WriteString(model.Duration(-node.OriginalOffset).String())
+	}
+	return b.String()
 }

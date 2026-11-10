@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,16 +19,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-var (
-	clientGoRequestMetrics  = &clientGoRequestMetricAdapter{}
-	clientGoWorkloadMetrics = &clientGoWorkqueueMetricsProvider{}
-)
-
-func init() {
-	clientGoRequestMetrics.RegisterWithK8sGoClient()
-	clientGoWorkloadMetrics.RegisterWithK8sGoClient()
-}
-
 // Metrics to be used with a discovery manager.
 type Metrics struct {
 	FailedConfigs     prometheus.Gauge
@@ -36,6 +26,7 @@ type Metrics struct {
 	ReceivedUpdates   prometheus.Counter
 	DelayedUpdates    prometheus.Counter
 	SentUpdates       prometheus.Counter
+	LastUpdated       *prometheus.GaugeVec
 }
 
 func NewManagerMetrics(registerer prometheus.Registerer, sdManagerName string) (*Metrics, error) {
@@ -82,12 +73,22 @@ func NewManagerMetrics(registerer prometheus.Registerer, sdManagerName string) (
 		},
 	)
 
+	m.LastUpdated = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name:        "prometheus_sd_last_update_timestamp_seconds",
+			Help:        "Timestamp of the last update sent to the SD consumers.",
+			ConstLabels: prometheus.Labels{"name": sdManagerName},
+		},
+		[]string{"config"},
+	)
+
 	metrics := []prometheus.Collector{
 		m.FailedConfigs,
 		m.DiscoveredTargets,
 		m.ReceivedUpdates,
 		m.DelayedUpdates,
 		m.SentUpdates,
+		m.LastUpdated,
 	}
 
 	for _, collector := range metrics {
@@ -98,4 +99,14 @@ func NewManagerMetrics(registerer prometheus.Registerer, sdManagerName string) (
 	}
 
 	return m, nil
+}
+
+// Unregister unregisters all metrics.
+func (m *Metrics) Unregister(registerer prometheus.Registerer) {
+	registerer.Unregister(m.FailedConfigs)
+	registerer.Unregister(m.DiscoveredTargets)
+	registerer.Unregister(m.ReceivedUpdates)
+	registerer.Unregister(m.DelayedUpdates)
+	registerer.Unregister(m.SentUpdates)
+	registerer.Unregister(m.LastUpdated)
 }

@@ -15,11 +15,16 @@ import { Diagnostic } from '@codemirror/lint';
 import { SyntaxNode, Tree } from '@lezer/common';
 import {
   AggregateExpr,
+  AnchoredExpr,
   And,
   BinaryExpr,
   BoolModifier,
   Bottomk,
+  Changes,
   CountValues,
+  Delta,
+  DurationExpr,
+  DurationRange,
   Eql,
   EqlSingle,
   FunctionCall,
@@ -27,28 +32,40 @@ import {
   Gte,
   Gtr,
   Identifier,
-  LabelMatcher,
+  Increase,
   LabelMatchers,
+  LimitK,
+  LimitRatio,
   Lss,
   Lte,
   MatrixSelector,
   Neq,
+  OffsetDurationExpr,
+  OffsetExpr,
   Or,
   ParenExpr,
   Quantile,
+  QuotedLabelMatcher,
+  QuotedLabelName,
+  Rate,
+  Resets,
+  SmoothedExpr,
   StepInvariantExpr,
   SubqueryExpr,
   Topk,
+  TrimLower,
+  TrimUpper,
   UnaryExpr,
   Unless,
+  UnquotedLabelMatcher,
   VectorSelector,
 } from '@prometheus-io/lezer-promql';
-import { containsAtLeastOneChild } from './path-finder';
+import { containsAtLeastOneChild, containsChild } from './path-finder';
 import { getType } from './type';
 import { buildLabelMatchers } from './matcher';
 import { EditorState } from '@codemirror/state';
 import { syntaxTree } from '@codemirror/language';
-import { getFunction, Matcher, VectorMatchCardinality, ValueType } from '../types';
+import { getFunction, Matcher, ValueType, VectorMatchCardinality } from '../types';
 import { buildVectorMatching } from './vector';
 
 export class Parser {
@@ -81,14 +98,22 @@ export class Parser {
       // usually there is an error node at the end of the expression when user is typing
       // so it's not really a useful information to say the expression is wrong.
       // Hopefully if there is an error node at the end of the tree, checkAST should yell more precisely
-      if (cursor.type.id === 0 && cursor.to !== this.tree.topNode.to) {
-        const node = cursor.node.parent;
-        this.diagnostics.push({
-          severity: 'error',
-          message: 'unexpected expression',
-          from: node ? node.from : cursor.from,
-          to: node ? node.to : cursor.to,
-        });
+      if (cursor.type.id === 0) {
+        // Invalid offset syntax: `checkAST` emits a targeted message, so skip
+        // the generic parse error on the same span.
+        const errParent = cursor.node.parent;
+        if (errParent?.type.id === OffsetExpr) {
+          continue;
+        }
+        if (cursor.to !== this.tree.topNode.to) {
+          const node = cursor.node.parent;
+          this.diagnostics.push({
+            severity: 'error',
+            message: 'unexpected expression',
+            from: node ? node.from : cursor.from,
+            to: node ? node.to : cursor.to,
+          });
+        }
       }
     }
   }
@@ -112,25 +137,61 @@ export class Parser {
       case ParenExpr:
         this.checkAST(node.getChild('Expr'));
         break;
-      case UnaryExpr:
+      case UnaryExpr: {
         const unaryExprType = this.checkAST(node.getChild('Expr'));
         if (unaryExprType !== ValueType.scalar && unaryExprType !== ValueType.vector) {
           this.addDiagnostic(node, `unary expression only allowed on expressions of type scalar or instant vector, got ${unaryExprType}`);
         }
         break;
-      case SubqueryExpr:
+      }
+      case SmoothedExpr: {
+        this.checkAnchoredSmoothedExpr(node, [Rate, Increase, Delta]);
+        break;
+      }
+      case AnchoredExpr: {
+        this.checkAnchoredSmoothedExpr(node, [Resets, Changes, Rate, Increase, Delta]);
+        break;
+      }
+      case SubqueryExpr: {
         const subQueryExprType = this.checkAST(node.getChild('Expr'));
         if (subQueryExprType !== ValueType.vector) {
           this.addDiagnostic(node, `subquery is only allowed on instant vector, got ${subQueryExprType} in ${node.name} instead`);
         }
+        const subqueryStepExpr = this.getSubqueryStepDurationExpr(node);
+        // A subquery step should represent a resolution interval. range() in this
+        // position expands to the full query range and is not meaningful. We only
+        // warn when range() is the top-level step expression (the step
+        // `DurationExpr` is directly a `DurationRange`); nested uses such as
+        // `min_of(range(), 5m)` are bounded operands and remain valid.
+        if (subqueryStepExpr && this.isTopLevelDurationRangeExpr(subqueryStepExpr)) {
+          this.addDiagnosticWithSeverity(
+            subqueryStepExpr,
+            'range() is not meaningful as a subquery resolution step; consider a concrete duration',
+            'warning'
+          );
+        }
         break;
+      }
+      case OffsetExpr: {
+        // `checkAST` only recurses for explicit node kinds; there is no default
+        // branch that walks all children, so we must visit the vector operand.
+        this.checkAST(node.getChild('Expr'));
+        if (!node.getChild(OffsetDurationExpr)) {
+          // Always emit this message (do not gate on `OffsetExpr.to === topNode.to`:
+          // the query box often has trailing space, so that check never matched in the UI).
+          // `diagnoseAllErrorNodes` skips direct `OffsetExpr` error children so we do not
+          // duplicate its generic `'unexpected expression'` diagnostic.
+          this.addDiagnostic(node, 'offset requires a duration expression');
+        }
+        break;
+      }
       case MatrixSelector:
         this.checkAST(node.getChild('Expr'));
         break;
       case VectorSelector:
         this.checkVectorSelector(node);
         break;
-      case StepInvariantExpr:
+      case StepInvariantExpr: {
         const exprValue = this.checkAST(node.getChild('Expr'));
         if (exprValue !== ValueType.vector && exprValue !== ValueType.matrix) {
           this.addDiagnostic(node, `@ modifier must be preceded by an instant selector vector or range vector selector or a subquery`);
@@ -139,11 +200,12 @@ export class Parser {
         // Specially the one checking if the timestamp after the `@` is ok: https://github.com/prometheus/prometheus/blob/ad5ed416ba635834370bfa06139258b31f8c33f9/promql/parser/parse.go#L722-L725
         // Since Javascript is managing the number as a float64 and so on 53 bits, we cannot validate that the maxInt64 number is a valid value.
         // So, to manage properly this issue, we would need to use the BigInt which is possible or by using ES2020.BigInt, or by using the lib: https://github.com/GoogleChromeLabs/jsbi.
-        //   * Introducing a lib just for theses checks is quite overkilled
+        //   * Introducing a lib just for these checks is quite overkilled
         //   * Using ES2020 would be the way to go. Unfortunately moving to ES2020 is breaking the build of the lib.
         //     So far I didn't find the way to fix it. I think it's likely due to the fact we are building an ESM package which is now something stable in nodeJS/javascript but still experimental in typescript.
         // For the above reason, we decided to drop these checks.
         break;
+      }
     }
 
     return getType(node);
@@ -165,7 +227,13 @@ export class Parser {
     }
     this.expectType(params[params.length - 1], ValueType.vector, 'aggregation expression');
     // get the parameter of the aggregation operator
-    if (aggregateOp.type.id === Topk || aggregateOp.type.id === Bottomk || aggregateOp.type.id === Quantile) {
+    if (
+      aggregateOp.type.id === Topk ||
+      aggregateOp.type.id === Bottomk ||
+      aggregateOp.type.id === LimitK ||
+      aggregateOp.type.id === LimitRatio ||
+      aggregateOp.type.id === Quantile
+    ) {
       this.expectType(params[0], ValueType.scalar, 'aggregation parameter');
     }
     if (aggregateOp.type.id === CountValues) {
@@ -187,6 +255,8 @@ export class Parser {
     const rt = this.checkAST(rExpr);
     const boolModifierUsed = node.getChild(BoolModifier);
     const isComparisonOperator = containsAtLeastOneChild(node, Eql, Neq, Lte, Lss, Gte, Gtr);
+    const isTrimLowerOperator = containsChild(node, TrimLower);
+    const isTrimUpperOperator = containsChild(node, TrimUpper);
     const isSetOperator = containsAtLeastOneChild(node, And, Or, Unless);
 
     // BOOL modifier check
@@ -195,8 +265,14 @@ export class Parser {
         this.addDiagnostic(node, 'bool modifier can only be used on comparison operators');
       }
     } else {
-      if (isComparisonOperator && lt === ValueType.scalar && rt === ValueType.scalar) {
-        this.addDiagnostic(node, 'comparisons between scalars must use BOOL modifier');
+      if (lt === ValueType.scalar && rt === ValueType.scalar) {
+        if (isComparisonOperator) {
+          this.addDiagnostic(node, 'comparisons between scalars must use BOOL modifier');
+        } else if (isTrimLowerOperator) {
+          this.addDiagnostic(node, 'operator ">/" not allowed for Scalar operations');
+        } else if (isTrimUpperOperator) {
+          this.addDiagnostic(node, 'operator "</" not allowed for Scalar operations');
+        }
       }
     }
 
@@ -265,9 +341,15 @@ export class Parser {
       }
     }
 
-    let j = 0;
+    if (funcSignature.name === 'info') {
+      // Verify that the data label selector expression is not prefixed with metric name.
+      if (args.length > 1 && args[1].getChild(Identifier)) {
+        this.addDiagnostic(node, `expected label selectors as the second argument to "info" function, got ${args[1].type}`);
+      }
+    }
+
     for (let i = 0; i < args.length; i++) {
-      j = i;
+      let j = i;
       if (j >= funcSignature.argTypes.length) {
         if (funcSignature.variadic === 0) {
           // This is not a vararg function so we should not check the
@@ -280,9 +362,38 @@ export class Parser {
     }
   }
 
+  private checkAnchoredSmoothedExpr(node: SyntaxNode, allowedFunctions: number[]): void {
+    // A smoothed/anchored expression is supposed to work with range vectors or instant vectors.
+    // So first thing to do is to check the type of the child.
+    // Then, if this is used inside a function call, we need to check that the function is one of the given allowedFunctions.
+    const nodeType = getType(node);
+    if (nodeType !== ValueType.vector && nodeType !== ValueType.matrix) {
+      this.addDiagnostic(node, `smoothed/anchored expression only allowed on instant vector or range vector selector, got ${nodeType} instead`);
+      return;
+    }
+    const parent = node.parent?.parent;
+    if (!parent || parent.type.id !== FunctionCall) {
+      // Since the anchored/smoothed expression is not inside a function call, we cannot check the function name.
+      // This is an acceptable case as the anchored/smoothed expression can be used on any vector expression.
+      return;
+    }
+    const funcID = parent.firstChild?.firstChild;
+    if (!funcID) {
+      this.addDiagnostic(node, 'function not defined');
+      return;
+    }
+    if (!allowedFunctions.includes(funcID.type.id)) {
+      this.addDiagnostic(node, 'smoothed/anchored expression can only be used in specific functions');
+    }
+  }
+
   private checkVectorSelector(node: SyntaxNode): void {
     const matchList = node.getChild(LabelMatchers);
-    const labelMatchers = buildLabelMatchers(matchList ? matchList.getChildren(LabelMatcher) : [], this.state);
+    const labelMatcherOpts = [QuotedLabelName, QuotedLabelMatcher, UnquotedLabelMatcher];
+    let labelMatchers: Matcher[] = [];
+    for (const labelMatcherOpt of labelMatcherOpts) {
+      labelMatchers = labelMatchers.concat(buildLabelMatchers(matchList ? matchList.getChildren(labelMatcherOpt) : [], this.state));
+    }
     let vectorSelectorName = '';
     // VectorSelector ( Identifier )
     // https://github.com/promlabs/lezer-promql/blob/71e2f9fa5ae6f5c5547d5738966cd2512e6b99a8/src/promql.grammar#L200
@@ -301,6 +412,14 @@ export class Parser {
       // adding the metric name as a Matcher to avoid a false positive for this kind of expression:
       // foo{bare=''}
       labelMatchers.push(new Matcher(EqlSingle, '__name__', vectorSelectorName));
+    } else {
+      // In this case when metric name is not set outside the braces
+      // It is checking whether metric name is set twice like in :
+      // {__name__:"foo", "foo"}, {"foo", "bar"}
+      const labelMatchersMetricName = labelMatchers.filter((lm) => lm.name === '__name__');
+      if (labelMatchersMetricName.length > 1) {
+        this.addDiagnostic(node, `metric name must not be set twice: ${labelMatchersMetricName[0].value} or ${labelMatchersMetricName[1].value}`);
+      }
     }
 
     // A Vector selector must contain at least one non-empty matcher to prevent
@@ -319,11 +438,39 @@ export class Parser {
   }
 
   private addDiagnostic(node: SyntaxNode, msg: string): void {
+    this.addDiagnosticWithSeverity(node, msg, 'error');
+  }
+
+  private addDiagnosticWithSeverity(node: SyntaxNode, msg: string, severity: 'error' | 'warning'): void {
     this.diagnostics.push({
-      severity: 'error',
+      severity: severity,
       message: msg,
       from: node.from,
       to: node.to,
     });
+  }
+
+  // isTopLevelDurationRangeExpr reports whether the step `DurationExpr` is
+  // directly a `range()` call. `durationPrimary` is inlined in the grammar, so a
+  // top-level `range()` step appears as an immediate `DurationRange` child of the
+  // step `DurationExpr`. Nested uses (e.g. inside `min_of`/`max_of` or
+  // arithmetic) are represented by deeper nodes and must not trigger the warning.
+  private isTopLevelDurationRangeExpr(node: SyntaxNode): boolean {
+    return node.getChild(DurationRange) !== null;
+  }
+
+  /**
+   * Returns the duration expression used as the subquery resolution step (after
+   * the `:`). Lezer represents `SubqueryExpr` with direct children only
+   * (`VectorSelector` plus one or two `DurationExpr` nodes), so the step is the
+   * last direct `DurationExpr` when two are present. This avoids confusing
+   * colons inside label matchers with the subquery colon.
+   */
+  private getSubqueryStepDurationExpr(node: SyntaxNode): SyntaxNode | null {
+    const durationExprs = node.getChildren(DurationExpr);
+    if (durationExprs.length < 2) {
+      return null;
+    }
+    return durationExprs[durationExprs.length - 1];
   }
 }

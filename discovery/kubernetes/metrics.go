@@ -1,4 +1,4 @@
-// Copyright 2015 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,12 +22,13 @@ import (
 var _ discovery.DiscovererMetrics = (*kubernetesMetrics)(nil)
 
 type kubernetesMetrics struct {
-	eventCount *prometheus.CounterVec
+	eventCount    *prometheus.CounterVec
+	failuresCount prometheus.Counter
 
 	metricRegisterer discovery.MetricRegisterer
 }
 
-func newDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
+func newDiscovererMetrics(reg prometheus.Registerer, _ discovery.RefreshMetricsInstantiator) discovery.DiscovererMetrics {
 	m := &kubernetesMetrics{
 		eventCount: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
@@ -37,10 +38,18 @@ func newDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetric
 			},
 			[]string{"role", "event"},
 		),
+		failuresCount: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Namespace: discovery.KubernetesMetricsNamespace,
+				Name:      "failures_total",
+				Help:      "The number of failed WATCH/LIST requests.",
+			},
+		),
 	}
 
 	m.metricRegisterer = discovery.NewMetricRegisterer(reg, []prometheus.Collector{
 		m.eventCount,
+		m.failuresCount,
 	})
 
 	// Initialize metric vectors.
@@ -60,6 +69,8 @@ func newDiscovererMetrics(reg prometheus.Registerer, rmi discovery.RefreshMetric
 			m.eventCount.WithLabelValues(role, evt)
 		}
 	}
+
+	m.failuresCount.Add(0)
 
 	return m
 }

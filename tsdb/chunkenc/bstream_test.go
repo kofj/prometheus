@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,10 +14,62 @@
 package chunkenc
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestBstream_Reset(t *testing.T) {
+	bs := bstream{
+		stream: []byte("test"),
+		count:  10,
+	}
+	bs.Reset([]byte("was reset"))
+
+	require.Equal(t, bstream{
+		stream: []byte("was reset"),
+		count:  0,
+	}, bs)
+}
+
+// BenchmarkWriteBits benchmarks writeBits for various bit widths.
+func BenchmarkWriteBits(b *testing.B) {
+	sizes := []int{1, 8, 17, 32, 52, 64}
+	for _, nbits := range sizes {
+		b.Run(fmt.Sprintf("nbits=%d", nbits), func(b *testing.B) {
+			b.ReportAllocs()
+			var bs bstream
+			bs.stream = make([]byte, 0, 1024)
+			for range b.N {
+				bs.stream = bs.stream[:0]
+				bs.count = 0
+				for j := range 100 {
+					bs.writeBits(uint64(j), nbits)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkWriteBitsFast benchmarks writeBitsFast for various bit widths.
+func BenchmarkWriteBitsFast(b *testing.B) {
+	sizes := []int{1, 8, 17, 32, 52, 64}
+	for _, nbits := range sizes {
+		b.Run(fmt.Sprintf("nbits=%d", nbits), func(b *testing.B) {
+			b.ReportAllocs()
+			var bs bstream
+			bs.stream = make([]byte, 0, 1024)
+			for range b.N {
+				bs.stream = bs.stream[:0]
+				bs.count = 0
+				for j := range 100 {
+					bs.writeBitsFast(uint64(j), nbits)
+				}
+			}
+		})
+	}
+}
 
 func TestBstreamReader(t *testing.T) {
 	// Write to the bit stream.

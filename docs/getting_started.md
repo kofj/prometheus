@@ -3,8 +3,6 @@ title: Getting started
 sort_rank: 1
 ---
 
-# Getting started
-
 This guide is a "Hello World"-style tutorial which shows how to install,
 configure, and use a simple Prometheus instance. You will download and run
 Prometheus locally, configure it to scrape itself and an example application,
@@ -18,7 +16,7 @@ your platform, then extract and run it:
 
 ```bash
 tar xvfz prometheus-*.tar.gz
-cd prometheus-*
+cd prometheus-*/
 ```
 
 Before starting Prometheus, let's configure it.
@@ -81,7 +79,7 @@ navigating to its metrics endpoint:
 
 Let us explore data that Prometheus has collected about itself. To
 use Prometheus's built-in expression browser, navigate to
-http://localhost:9090/graph and choose the "Table" view within the "Graph" tab.
+http://localhost:9090/query and choose the "Graph" tab.
 
 As you can gather from [localhost:9090/metrics](http://localhost:9090/metrics),
 one metric that Prometheus exports about itself is named
@@ -115,7 +113,7 @@ For more about the expression language, see the
 
 ## Using the graphing interface
 
-To graph expressions, navigate to http://localhost:9090/graph and use the "Graph"
+To graph expressions, navigate to http://localhost:9090/query and use the "Graph"
 tab.
 
 For example, enter the following expression to graph the per-second rate of chunks
@@ -136,7 +134,7 @@ The Node Exporter is used as an example target, for more information on using it
 
 ```bash
 tar -xzvf node_exporter-*.*.tar.gz
-cd node_exporter-*.*
+cd node_exporter-*.*/
 
 # Start 3 example targets in separate terminals:
 ./node_exporter --web.listen-address 127.0.0.1:8080
@@ -180,6 +178,28 @@ scrape_configs:
 Go to the expression browser and verify that Prometheus now has information
 about time series that these example endpoints expose, such as `node_cpu_seconds_total`.
 
+To check that Prometheus is scraping the new targets, go to
+[localhost:9090/targets](http://localhost:9090/targets), or open the **Status**
+menu and select **Target health**. Under the `node` job you should see the three
+endpoints, each with a state of `UP`. Following the configuration above,
+`localhost:8080` and `localhost:8081` are labeled `group="production"` and
+`localhost:8082` is labeled `group="canary"`. If an endpoint shows `DOWN`, make
+sure the corresponding Node Exporter is still running on that port.
+
+To confirm the metrics are available, first open a target's `/metrics` endpoint
+directly, for example [localhost:8080/metrics](http://localhost:8080/metrics), to
+see the raw metric names it exposes. Then enter one of them, such as 
+`node_cpu_seconds_total`, into the expression browser and click "Execute". This
+should return one time series per CPU and mode for each instance, for example:
+
+​```
+node_cpu_seconds_total{cpu="0",group="production",instance="localhost:8080",job="node",mode="idle"}
+​```
+
+To browse every metric name that is currently available, open the query options
+menu (the three-dots button to the right of the expression input) and select
+**Explore metrics**. 
+
 ## Configure rules for aggregating scraped data into new time series
 
 Though not a problem in our example, queries that aggregate over thousands of
@@ -200,7 +220,7 @@ To record the time series resulting from this expression into a new metric
 called `job_instance_mode:node_cpu_seconds:avg_rate5m`, create a file
 with the following recording rule and save it as `prometheus.rules.yml`:
 
-```
+```yaml
 groups:
 - name: cpu-node
   rules:
@@ -259,9 +279,12 @@ process by using the `SIGHUP` signal. If you're running on Linux this can be
 performed by using `kill -s SIGHUP <PID>`, replacing `<PID>` with your Prometheus
 process ID.
 
-## Shutting down your instance gracefully.
+## Shutting down your instance gracefully
 
 While Prometheus does have recovery mechanisms in the case that there is an
-abrupt process failure it is recommend to use the `SIGTERM` signal to cleanly
-shutdown a Prometheus instance. If you're running on Linux this can be performed
-by using `kill -s SIGTERM <PID>`, replacing `<PID>` with your Prometheus process ID.
+abrupt process failure it is recommended to use signals or interrupts for a
+clean shutdown of a Prometheus instance. On Linux, this can be done by sending
+the `SIGTERM` or `SIGINT` signals to the Prometheus process. For example, you
+can use `kill -s <SIGNAL> <PID>`, replacing `<SIGNAL>` with the signal name
+and `<PID>` with the Prometheus process ID. Alternatively, you can press the
+interrupt character at the controlling terminal, which by default is `^C` (Control-C).

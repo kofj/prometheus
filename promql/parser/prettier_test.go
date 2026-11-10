@@ -1,4 +1,4 @@
-// Copyright 2022 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -114,7 +114,7 @@ task:errors:rate10s{job="s"}))`,
 		},
 	}
 	for _, test := range inputs {
-		expr, err := ParseExpr(test.in)
+		expr, err := testParser.ParseExpr(test.in)
 		require.NoError(t, err)
 
 		require.Equal(t, test.out, Prettify(expr))
@@ -147,6 +147,12 @@ func TestBinaryExprPretty(t *testing.T) {
 			out: `  foo_1
 +
   foo_2`,
+		},
+		{
+			in: `Inf ^ foo_1`,
+			out: `  (+Inf)
+^
+  foo_1`,
 		},
 		{
 			in: `foo_1 + foo_2 + foo_3`,
@@ -185,7 +191,7 @@ func TestBinaryExprPretty(t *testing.T) {
 	}
 	for _, test := range inputs {
 		t.Run(test.in, func(t *testing.T) {
-			expr, err := ParseExpr(test.in)
+			expr, err := testParser.ParseExpr(test.in)
 			require.NoError(t, err)
 
 			require.Equal(t, test.out, Prettify(expr))
@@ -261,7 +267,7 @@ func TestCallExprPretty(t *testing.T) {
 		},
 	}
 	for _, test := range inputs {
-		expr, err := ParseExpr(test.in)
+		expr, err := testParser.ParseExpr(test.in)
 		require.NoError(t, err)
 
 		fmt.Println("=>", expr.String())
@@ -308,7 +314,7 @@ func TestParenExprPretty(t *testing.T) {
 		},
 	}
 	for _, test := range inputs {
-		expr, err := ParseExpr(test.in)
+		expr, err := testParser.ParseExpr(test.in)
 		require.NoError(t, err)
 
 		require.Equal(t, test.out, Prettify(expr))
@@ -334,7 +340,7 @@ func TestStepInvariantExpr(t *testing.T) {
 		},
 	}
 	for _, test := range inputs {
-		expr, err := ParseExpr(test.in)
+		expr, err := testParser.ParseExpr(test.in)
 		require.NoError(t, err)
 
 		require.Equal(t, test.out, Prettify(expr))
@@ -594,7 +600,7 @@ or
 		},
 	}
 	for _, test := range inputs {
-		expr, err := ParseExpr(test.in)
+		expr, err := testParser.ParseExpr(test.in)
 		require.NoError(t, err)
 		require.Equal(t, test.out, Prettify(expr))
 	}
@@ -662,7 +668,41 @@ func TestUnaryPretty(t *testing.T) {
 	}
 	for _, test := range inputs {
 		t.Run(test.in, func(t *testing.T) {
-			expr, err := ParseExpr(test.in)
+			expr, err := testParser.ParseExpr(test.in)
+			require.NoError(t, err)
+			require.Equal(t, test.out, Prettify(expr))
+		})
+	}
+}
+
+func TestDurationExprPretty(t *testing.T) {
+	optsParser := NewParser(Options{})
+	maxCharactersPerLine = 10
+	inputs := []struct {
+		in, out string
+	}{
+		{
+			in: `rate(foo[2*1h])`,
+			out: `rate(
+  foo[2 * 1h]
+)`,
+		},
+		{
+			in: `rate(foo[2*1h])`,
+			out: `rate(
+  foo[2 * 1h]
+)`,
+		},
+		{
+			in: `rate(foo[-5m+35m])`,
+			out: `rate(
+  foo[-5m + 35m]
+)`,
+		},
+	}
+	for _, test := range inputs {
+		t.Run(test.in, func(t *testing.T) {
+			expr, err := optsParser.ParseExpr(test.in)
 			require.NoError(t, err)
 			require.Equal(t, test.out, Prettify(expr))
 		})

@@ -1,4 +1,4 @@
-// Copyright 2013 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,19 +15,20 @@ package rules
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
 	"github.com/prometheus/common/model"
 	"go.uber.org/atomic"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/model/rulefmt"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
@@ -46,12 +47,20 @@ const (
 	alertStateLabel = "alertstate"
 )
 
+var _ Rule = (*AlertingRule)(nil)
+
+// ErrDuplicateAlertLabelSet is returned when an alerting rule evaluation produces
+// metrics with identical labelsets after applying alert labels.
+var ErrDuplicateAlertLabelSet = errors.New("vector contains metrics with the same labelset after applying alert labels")
+
 // AlertState denotes the state of an active alert.
 type AlertState int
 
 const (
+	// StateUnknown is the state of an alert that has not yet been evaluated.
+	StateUnknown AlertState = iota
 	// StateInactive is the state of an alert that is neither firing nor pending.
-	StateInactive AlertState = iota
+	StateInactive
 	// StatePending is the state of an alert that has been active for less than
 	// the configured threshold duration.
 	StatePending
@@ -62,6 +71,8 @@ const (
 
 func (s AlertState) String() string {
 	switch s {
+	case StateUnknown:
+		return "unknown"
 	case StateInactive:
 		return "inactive"
 	case StatePending:
@@ -141,17 +152,18 @@ type AlertingRule struct {
 	// the fingerprint of the labelset they correspond to.
 	active map[uint64]*Alert
 
-	logger log.Logger
+	logger *slog.Logger
 
-	noDependentRules  *atomic.Bool
-	noDependencyRules *atomic.Bool
+	dependenciesMutex sync.RWMutex
+	dependentRules    []Rule
+	dependencyRules   []Rule
 }
 
 // NewAlertingRule constructs a new AlertingRule.
 func NewAlertingRule(
 	name string, vec parser.Expr, hold, keepFiringFor time.Duration,
 	labels, annotations, externalLabels labels.Labels, externalURL string,
-	restored bool, logger log.Logger,
+	restored bool, logger *slog.Logger,
 ) *AlertingRule {
 	el := externalLabels.Map()
 
@@ -171,8 +183,6 @@ func NewAlertingRule(
 		evaluationTimestamp: atomic.NewTime(time.Time{}),
 		evaluationDuration:  atomic.NewDuration(0),
 		lastError:           atomic.NewError(nil),
-		noDependentRules:    atomic.NewBool(false),
-		noDependencyRules:   atomic.NewBool(false),
 	}
 }
 
@@ -222,6 +232,11 @@ func (r *AlertingRule) Labels() labels.Labels {
 	return r.labels
 }
 
+// Metadata returns the metric metadata associated with the alerting rule.
+func (*AlertingRule) Metadata() metadata.Metadata {
+	return metadata.Metadata{}
+}
+
 // Annotations returns the annotations of the alerting rule.
 func (r *AlertingRule) Annotations() labels.Labels {
 	return r.annotations
@@ -246,13 +261,16 @@ func (r *AlertingRule) sample(alert *Alert, ts time.Time) promql.Sample {
 	return s
 }
 
-// forStateSample returns the sample for ALERTS_FOR_STATE.
+// forStateSample returns a promql.Sample with the rule labels, `ALERTS_FOR_STATE` as the metric name and the rule name as the `alertname` label.
+// Optionally, if an alert is provided it'll copy the labels of the alert into the sample labels.
 func (r *AlertingRule) forStateSample(alert *Alert, ts time.Time, v float64) promql.Sample {
 	lb := labels.NewBuilder(r.labels)
 
-	alert.Labels.Range(func(l labels.Label) {
-		lb.Set(l.Name, l.Value)
-	})
+	if alert != nil {
+		alert.Labels.Range(func(l labels.Label) {
+			lb.Set(l.Name, l.Value)
+		})
+	}
 
 	lb.Set(labels.MetricName, alertForStateMetricName)
 	lb.Set(labels.AlertName, r.name)
@@ -265,31 +283,27 @@ func (r *AlertingRule) forStateSample(alert *Alert, ts time.Time, v float64) pro
 	return s
 }
 
-// QueryforStateSeries returns the series for ALERTS_FOR_STATE.
-func (r *AlertingRule) QueryforStateSeries(ctx context.Context, alert *Alert, q storage.Querier) (storage.Series, error) {
-	smpl := r.forStateSample(alert, time.Now(), 0)
+// QueryForStateSeries returns the series for ALERTS_FOR_STATE of the alert rule.
+func (r *AlertingRule) QueryForStateSeries(ctx context.Context, q storage.Querier) (storage.SeriesSet, error) {
+	// We use a sample to ease the building of matchers.
+	// Don't provide an alert as we want matchers that match all series for the alert rule.
+	smpl := r.forStateSample(nil, time.Now(), 0)
 	var matchers []*labels.Matcher
 	smpl.Metric.Range(func(l labels.Label) {
+		// Skip labels with template syntax: their values are expanded per alert
+		// instance and would not match the stored series.
+		if strings.Contains(l.Value, "{{") {
+			return
+		}
 		mt, err := labels.NewMatcher(labels.MatchEqual, l.Name, l.Value)
 		if err != nil {
 			panic(err)
 		}
 		matchers = append(matchers, mt)
 	})
+
 	sset := q.Select(ctx, false, nil, matchers...)
-
-	var s storage.Series
-	for sset.Next() {
-		// Query assures that smpl.Metric is included in sset.At().Labels(),
-		// hence just checking the length would act like equality.
-		// (This is faster than calling labels.Compare again as we already have some info).
-		if sset.At().Labels().Len() == len(matchers) {
-			s = sset.At()
-			break
-		}
-	}
-
-	return s, sset.Err()
+	return sset, sset.Err()
 }
 
 // SetEvaluationDuration updates evaluationDuration to the duration it took to evaluate the rule on its last evaluation.
@@ -322,20 +336,54 @@ func (r *AlertingRule) Restored() bool {
 	return r.restored.Load()
 }
 
-func (r *AlertingRule) SetNoDependentRules(noDependentRules bool) {
-	r.noDependentRules.Store(noDependentRules)
+func (r *AlertingRule) SetDependentRules(dependents []Rule) {
+	r.dependenciesMutex.Lock()
+	defer r.dependenciesMutex.Unlock()
+
+	r.dependentRules = make([]Rule, len(dependents))
+	copy(r.dependentRules, dependents)
 }
 
 func (r *AlertingRule) NoDependentRules() bool {
-	return r.noDependentRules.Load()
+	r.dependenciesMutex.RLock()
+	defer r.dependenciesMutex.RUnlock()
+
+	if r.dependentRules == nil {
+		return false // We don't know if there are dependent rules.
+	}
+
+	return len(r.dependentRules) == 0
 }
 
-func (r *AlertingRule) SetNoDependencyRules(noDependencyRules bool) {
-	r.noDependencyRules.Store(noDependencyRules)
+func (r *AlertingRule) DependentRules() []Rule {
+	r.dependenciesMutex.RLock()
+	defer r.dependenciesMutex.RUnlock()
+	return r.dependentRules
+}
+
+func (r *AlertingRule) SetDependencyRules(dependencies []Rule) {
+	r.dependenciesMutex.Lock()
+	defer r.dependenciesMutex.Unlock()
+
+	r.dependencyRules = make([]Rule, len(dependencies))
+	copy(r.dependencyRules, dependencies)
 }
 
 func (r *AlertingRule) NoDependencyRules() bool {
-	return r.noDependencyRules.Load()
+	r.dependenciesMutex.RLock()
+	defer r.dependenciesMutex.RUnlock()
+
+	if r.dependencyRules == nil {
+		return false // We don't know if there are dependency rules.
+	}
+
+	return len(r.dependencyRules) == 0
+}
+
+func (r *AlertingRule) DependencyRules() []Rule {
+	r.dependenciesMutex.RLock()
+	defer r.dependenciesMutex.RUnlock()
+	return r.dependencyRules
 }
 
 // resolvedRetention is the duration for which a resolved alert instance
@@ -344,18 +392,15 @@ const resolvedRetention = 15 * time.Minute
 
 // Eval evaluates the rule expression and then creates pending alerts and fires
 // or removes previously pending alerts accordingly.
-func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, externalURL *url.URL, limit int) (promql.Vector, error) {
+func (r *AlertingRule) Eval(ctx context.Context, queryOffset time.Duration, ts time.Time, query QueryFunc, externalURL *url.URL, limit int) (promql.Vector, error) {
 	ctx = NewOriginContext(ctx, NewRuleDetail(r))
-
-	res, err := query(ctx, r.vector.String(), ts)
+	res, err := query(ctx, r.vector.String(), ts.Add(-queryOffset))
 	if err != nil {
 		return nil, err
 	}
 
 	// Create pending alerts for any new vector elements in the alert expression
 	// or update the expression value for existing elements.
-	resultFPs := map[uint64]struct{}{}
-
 	lb := labels.NewBuilder(labels.EmptyLabels())
 	sb := labels.NewScratchBuilder(0)
 	var vec promql.Vector
@@ -364,7 +409,7 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 		// Provide the alert information to the template.
 		l := smpl.Metric.Map()
 
-		tmplData := template.AlertTemplateData(l, r.externalLabels, r.externalURL, smpl.F)
+		tmplData := template.AlertTemplateData(l, r.externalLabels, r.externalURL, smpl)
 		// Inject some convenience variables that are easier to remember for users
 		// who are not used to Go's templating system.
 		defs := []string{
@@ -388,7 +433,7 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 			result, err := tmpl.Expand()
 			if err != nil {
 				result = fmt.Sprintf("<error expanding template: %s>", err)
-				level.Warn(r.logger).Log("msg", "Expanding alert template failed", "err", err, "data", tmplData)
+				r.logger.Warn("Expanding alert template failed", "err", err, "data", tmplData)
 			}
 			return result
 		}
@@ -408,10 +453,9 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 
 		lbs := lb.Labels()
 		h := lbs.Hash()
-		resultFPs[h] = struct{}{}
 
 		if _, ok := alerts[h]; ok {
-			return nil, fmt.Errorf("vector contains metrics with the same labelset after applying alert labels")
+			return nil, ErrDuplicateAlertLabelSet
 		}
 
 		alerts[h] = &Alert{
@@ -441,7 +485,7 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 	var numActivePending int
 	// Check if any pending alerts should be removed or fire now. Write out alert timeseries.
 	for fp, a := range r.active {
-		if _, ok := resultFPs[fp]; !ok {
+		if _, ok := alerts[fp]; !ok {
 			// There is no firing alerts for this fingerprint. The alert is no
 			// longer firing.
 
@@ -457,8 +501,17 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 				}
 			}
 
-			// If the alert was previously firing, keep it around for a given
-			// retention time so it is reported as resolved to the AlertManager.
+			// If the alert is resolved (was firing but is now inactive) keep it for
+			// at least the retention period. This is important for a number of reasons:
+			//
+			// 1. It allows for Prometheus to be more resilient to network issues that
+			//    would otherwise prevent a resolved alert from being reported as resolved
+			//    to Alertmanager.
+			//
+			// 2. It helps reduce the chance of resolved notifications being lost if
+			//    Alertmanager crashes or restarts between receiving the resolved alert
+			//    from Prometheus and sending the resolved notification. This tends to
+			//    occur for routes with large Group intervals.
 			if a.State == StatePending || (!a.ResolvedAt.IsZero() && ts.Sub(a.ResolvedAt) > resolvedRetention) {
 				delete(r.active, fp)
 			}
@@ -480,9 +533,17 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 			a.FiredAt = ts
 		}
 
+		// If the alert is firing and the active time is less than the new hold duration, set the state to pending.
+		if a.State == StateFiring && ts.Sub(a.ActiveAt) < r.holdDuration {
+			a.State = StatePending
+			a.FiredAt = time.Time{}
+			a.LastSentAt = time.Time{}
+			a.KeepFiringSince = time.Time{}
+		}
+
 		if r.restored.Load() {
-			vec = append(vec, r.sample(a, ts))
-			vec = append(vec, r.forStateSample(a, ts, float64(a.ActiveAt.Unix())))
+			vec = append(vec, r.sample(a, ts.Add(-queryOffset)))
+			vec = append(vec, r.forStateSample(a, ts.Add(-queryOffset), float64(a.ActiveAt.Unix())))
 		}
 	}
 
@@ -495,10 +556,14 @@ func (r *AlertingRule) Eval(ctx context.Context, ts time.Time, query QueryFunc, 
 }
 
 // State returns the maximum state of alert instances for this rule.
-// StateFiring > StatePending > StateInactive.
+// StateFiring > StatePending > StateInactive > StateUnknown.
 func (r *AlertingRule) State() AlertState {
 	r.activeMtx.Lock()
 	defer r.activeMtx.Unlock()
+	// Check if the rule has been evaluated
+	if r.evaluationTimestamp.Load().IsZero() {
+		return StateUnknown
+	}
 
 	maxState := StateInactive
 	for _, a := range r.active {
@@ -548,16 +613,20 @@ func (r *AlertingRule) ForEachActiveAlert(f func(*Alert)) {
 	}
 }
 
+func (r *AlertingRule) ActiveAlertsCount() int {
+	r.activeMtx.Lock()
+	defer r.activeMtx.Unlock()
+
+	return len(r.active)
+}
+
 func (r *AlertingRule) sendAlerts(ctx context.Context, ts time.Time, resendDelay, interval time.Duration, notifyFunc NotifyFunc) {
 	alerts := []*Alert{}
 	r.ForEachActiveAlert(func(alert *Alert) {
 		if alert.needsSending(ts, resendDelay) {
 			alert.LastSentAt = ts
 			// Allow for two Eval or Alertmanager send failures.
-			delta := resendDelay
-			if interval > resendDelay {
-				delta = interval
-			}
+			delta := max(interval, resendDelay)
 			alert.ValidUntil = ts.Add(4 * delta)
 			anew := *alert
 			// The notifier re-uses the labels slice, hence make a copy.
@@ -566,6 +635,14 @@ func (r *AlertingRule) sendAlerts(ctx context.Context, ts time.Time, resendDelay
 		}
 	})
 	notifyFunc(ctx, r.vector.String(), alerts...)
+}
+
+// LogValue returns the rule's representation for logging.
+func (r *AlertingRule) LogValue() slog.Value {
+	if r == nil {
+		return slog.AnyValue(nil)
+	}
+	return slog.StringValue(r.String())
 }
 
 func (r *AlertingRule) String() string {

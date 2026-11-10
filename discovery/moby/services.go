@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,8 +19,9 @@ import (
 	"net"
 	"strconv"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/swarm"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
 	"github.com/prometheus/common/model"
 
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -46,7 +47,7 @@ func (d *Discovery) refreshServices(ctx context.Context) ([]*targetgroup.Group, 
 		Source: "DockerSwarm",
 	}
 
-	services, err := d.client.ServiceList(ctx, types.ServiceListOptions{Filters: d.filters})
+	services, err := d.client.ServiceList(ctx, client.ServiceListOptions{Filters: d.filters})
 	if err != nil {
 		return nil, fmt.Errorf("error while listing swarm services: %w", err)
 	}
@@ -56,14 +57,19 @@ func (d *Discovery) refreshServices(ctx context.Context) ([]*targetgroup.Group, 
 		return nil, fmt.Errorf("error while computing swarm network labels: %w", err)
 	}
 
-	for _, s := range services {
+	for _, s := range services.Items {
 		commonLabels := map[string]string{
-			swarmLabelServiceID:                    s.ID,
-			swarmLabelServiceName:                  s.Spec.Name,
-			swarmLabelServiceTaskContainerHostname: s.Spec.TaskTemplate.ContainerSpec.Hostname,
-			swarmLabelServiceTaskContainerImage:    s.Spec.TaskTemplate.ContainerSpec.Image,
+			swarmLabelServiceID:   s.ID,
+			swarmLabelServiceName: s.Spec.Name,
 		}
 		commonLabels[swarmLabelServiceMode] = getServiceValueMode(s)
+
+		// ContainerSpec is only set for services whose task runtime is a
+		// container. It is nil for plugin and network-attachment services.
+		if s.Spec.TaskTemplate.ContainerSpec != nil {
+			commonLabels[swarmLabelServiceTaskContainerHostname] = s.Spec.TaskTemplate.ContainerSpec.Hostname
+			commonLabels[swarmLabelServiceTaskContainerImage] = s.Spec.TaskTemplate.ContainerSpec.Image
+		}
 
 		if s.UpdateStatus != nil {
 			commonLabels[swarmLabelServiceUpdatingStatus] = string(s.UpdateStatus.State)
@@ -76,13 +82,13 @@ func (d *Discovery) refreshServices(ctx context.Context) ([]*targetgroup.Group, 
 
 		for _, p := range s.Endpoint.VirtualIPs {
 			var added bool
-			ip, _, err := net.ParseCIDR(p.Addr)
+			ip, _, err := net.ParseCIDR(p.Addr.String())
 			if err != nil {
 				return nil, fmt.Errorf("error while parsing address %s: %w", p.Addr, err)
 			}
 
 			for _, e := range s.Endpoint.Ports {
-				if e.Protocol != swarm.PortConfigProtocolTCP {
+				if e.Protocol != network.TCP {
 					continue
 				}
 				labels := model.LabelSet{
@@ -116,7 +122,7 @@ func (d *Discovery) refreshServices(ctx context.Context) ([]*targetgroup.Group, 
 					labels[model.LabelName(k)] = model.LabelValue(v)
 				}
 
-				addr := net.JoinHostPort(ip.String(), fmt.Sprintf("%d", d.port))
+				addr := net.JoinHostPort(ip.String(), strconv.Itoa(d.port))
 				labels[model.AddressLabel] = model.LabelValue(addr)
 
 				tg.Targets = append(tg.Targets, labels)
@@ -127,13 +133,13 @@ func (d *Discovery) refreshServices(ctx context.Context) ([]*targetgroup.Group, 
 }
 
 func (d *Discovery) getServicesLabelsAndPorts(ctx context.Context) (map[string]map[string]string, map[string][]swarm.PortConfig, error) {
-	services, err := d.client.ServiceList(ctx, types.ServiceListOptions{})
+	services, err := d.client.ServiceList(ctx, client.ServiceListOptions{})
 	if err != nil {
 		return nil, nil, err
 	}
-	servicesLabels := make(map[string]map[string]string, len(services))
-	servicesPorts := make(map[string][]swarm.PortConfig, len(services))
-	for _, s := range services {
+	servicesLabels := make(map[string]map[string]string, len(services.Items))
+	servicesPorts := make(map[string][]swarm.PortConfig, len(services.Items))
+	for _, s := range services.Items {
 		servicesLabels[s.ID] = map[string]string{
 			swarmLabelServiceID:   s.ID,
 			swarmLabelServiceName: s.Spec.Name,

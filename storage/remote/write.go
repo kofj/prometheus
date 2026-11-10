@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,13 +16,15 @@ package remote
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/go-kit/log"
+	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/promslog"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/exemplar"
@@ -30,6 +32,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/wlog"
 )
 
@@ -38,25 +41,25 @@ var (
 		Namespace: namespace,
 		Subsystem: subsystem,
 		Name:      "samples_in_total",
-		Help:      "Samples in to remote storage, compare to samples out for queue managers.",
+		Help:      "Samples in to remote storage, compare to samples out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_samples_dropped_total",
 	})
 	exemplarsIn = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: subsystem,
 		Name:      "exemplars_in_total",
-		Help:      "Exemplars in to remote storage, compare to exemplars out for queue managers.",
+		Help:      "Exemplars in to remote storage, compare to exemplars out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_exemplars_dropped_total",
 	})
 	histogramsIn = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace,
 		Subsystem: subsystem,
 		Name:      "histograms_in_total",
-		Help:      "HistogramSamples in to remote storage, compare to histograms out for queue managers.",
+		Help:      "HistogramSamples in to remote storage, compare to histograms out for queue managers. Deprecated, check prometheus_wal_watcher_records_read_total and prometheus_remote_storage_histograms_dropped_total",
 	})
 )
 
 // WriteStorage represents all the remote write storage.
 type WriteStorage struct {
-	logger log.Logger
+	logger *slog.Logger
 	reg    prometheus.Registerer
 	mtx    sync.Mutex
 
@@ -71,14 +74,35 @@ type WriteStorage struct {
 	scraper           ReadyScrapeManager
 	quit              chan struct{}
 
+	recordBuf *record.BuffersPool
+
 	// For timestampTracker.
-	highestTimestamp *maxTimestamp
+	highestTimestamp         *maxTimestamp
+	enableTypeAndUnitLabels  bool
+	enableMetadataWALRecords bool
+	enableSTStorage          bool
+}
+
+// validateRemoteWriteFeatures validates that the required feature flags are enabled for all remote_write configurations.
+func validateRemoteWriteFeatures(rwConfs []*config.RemoteWriteConfig, enableTypeAndUnitLabels, enableMetadataWALRecords, enableSTStorage bool) error {
+	for _, rwConf := range rwConfs {
+		switch rwConf.Mode {
+		case remoteapi.WriteModeStateless, remoteapi.WriteModeStatelessST:
+			if !enableTypeAndUnitLabels && !enableMetadataWALRecords {
+				return fmt.Errorf("remote_write mode %q requires --enable-feature=metadata-wal-records or --enable-feature=type-and-unit-labels", rwConf.Mode)
+			}
+			if rwConf.Mode == remoteapi.WriteModeStatelessST && !enableSTStorage {
+				return fmt.Errorf("remote_write mode %q requires --enable-feature=st-storage", rwConf.Mode)
+			}
+		}
+	}
+	return nil
 }
 
 // NewWriteStorage creates and runs a WriteStorage.
-func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, dir string, flushDeadline time.Duration, sm ReadyScrapeManager) *WriteStorage {
+func NewWriteStorage(logger *slog.Logger, reg prometheus.Registerer, dir string, flushDeadline time.Duration, sm ReadyScrapeManager, enableTypeAndUnitLabels, enableMetadataWALRecords, enableSTStorage bool) *WriteStorage {
 	if logger == nil {
-		logger = log.NewNopLogger()
+		logger = promslog.NewNopLogger()
 	}
 	rws := &WriteStorage{
 		queues:            make(map[string]*QueueManager),
@@ -97,9 +121,13 @@ func NewWriteStorage(logger log.Logger, reg prometheus.Registerer, dir string, f
 				Namespace: namespace,
 				Subsystem: subsystem,
 				Name:      "highest_timestamp_in_seconds",
-				Help:      "Highest timestamp that has come into the remote storage via the Appender interface, in seconds since epoch.",
+				Help:      "Highest timestamp that has come into the remote storage via the Appender interface, in seconds since epoch. Initialized to 0 when no data has been received yet. Deprecated, check prometheus_remote_storage_queue_highest_timestamp_seconds which is more accurate.",
 			}),
 		},
+		recordBuf:                record.NewBuffersPool(),
+		enableTypeAndUnitLabels:  enableTypeAndUnitLabels,
+		enableMetadataWALRecords: enableMetadataWALRecords,
+		enableSTStorage:          enableSTStorage,
 	}
 	if reg != nil {
 		reg.MustRegister(rws.highestTimestamp)
@@ -137,13 +165,18 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 	rws.mtx.Lock()
 	defer rws.mtx.Unlock()
 
+	if err := validateRemoteWriteFeatures(conf.RemoteWriteConfigs, rws.enableTypeAndUnitLabels, rws.enableMetadataWALRecords, rws.enableSTStorage); err != nil {
+		return err
+	}
+
 	// Remote write queues only need to change if the remote write config or
 	// external labels change.
 	externalLabelUnchanged := labels.Equal(conf.GlobalConfig.ExternalLabels, rws.externalLabels)
-	rws.externalLabels = conf.GlobalConfig.ExternalLabels
 
+	// Nothing in rws is modified until every config has been built, so an
+	// error leaves the previous state intact.
 	newQueues := make(map[string]*QueueManager)
-	newHashes := []string{}
+	reusedClients := make(map[string]WriteClient)
 	for _, rwConf := range conf.RemoteWriteConfigs {
 		hash, err := toHash(rwConf)
 		if err != nil {
@@ -165,12 +198,16 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 
 		c, err := NewWriteClient(name, &ClientConfig{
 			URL:              rwConf.URL,
+			WriteProtoMsg:    rwConf.ProtobufMessage,
+			WriteMode:        rwConf.Mode,
 			Timeout:          rwConf.RemoteTimeout,
 			HTTPClientConfig: rwConf.HTTPClientConfig,
 			SigV4Config:      rwConf.SigV4Config,
 			AzureADConfig:    rwConf.AzureADConfig,
+			GoogleIAMConfig:  rwConf.GoogleIAMConfig,
 			Headers:          rwConf.Headers,
 			RetryOnRateLimit: rwConf.QueueConfig.RetryOnRateLimit,
+			RoundRobinDNS:    rwConf.RoundRobinDNS,
 		})
 		if err != nil {
 			return err
@@ -178,10 +215,8 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 
 		queue, ok := rws.queues[hash]
 		if externalLabelUnchanged && ok {
-			// Update the client in case any secret configuration has changed.
-			queue.SetClient(c)
 			newQueues[hash] = queue
-			delete(rws.queues, hash)
+			reusedClients[hash] = c
 			continue
 		}
 
@@ -207,19 +242,35 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 			rws.scraper,
 			rwConf.SendExemplars,
 			rwConf.SendNativeHistograms,
+			rws.enableTypeAndUnitLabels,
+			rwConf.ProtobufMessage,
+			rwConf.Mode,
+			rws.recordBuf,
+			rwConf.FailedRequestLogging,
+			rwConf.ConvertNHCBToClassic,
 		)
-		// Keep track of which queues are new so we know which to start.
-		newHashes = append(newHashes, hash)
 	}
 
-	// Anything remaining in rws.queues is a queue who's config has
-	// changed or was removed from the overall remote write config.
-	for _, q := range rws.queues {
-		q.Stop()
+	rws.externalLabels = conf.GlobalConfig.ExternalLabels
+
+	for hash, c := range reusedClients {
+		// Update the client in case any secret configuration has changed.
+		newQueues[hash].SetClient(c)
 	}
 
-	for _, hash := range newHashes {
-		newQueues[hash].Start()
+	// Stop queues whose config changed or that were removed from the remote
+	// write config.
+	for hash, q := range rws.queues {
+		if newQueues[hash] != q {
+			q.Stop()
+		}
+	}
+
+	// Only start queues that are new; reused ones are already running.
+	for hash, q := range newQueues {
+		if rws.queues[hash] != q {
+			q.Start()
+		}
 	}
 
 	rws.queues = newQueues
@@ -228,10 +279,22 @@ func (rws *WriteStorage) ApplyConfig(conf *config.Config) error {
 }
 
 // Appender implements storage.Storage.
-func (rws *WriteStorage) Appender(_ context.Context) storage.Appender {
+func (rws *WriteStorage) Appender(context.Context) storage.Appender {
 	return &timestampTracker{
-		writeStorage:         rws,
-		highestRecvTimestamp: rws.highestTimestamp,
+		baseTimestampTracker: baseTimestampTracker{
+			writeStorage:         rws,
+			highestRecvTimestamp: rws.highestTimestamp,
+		},
+	}
+}
+
+// AppenderV2 implements storage.Storage.
+func (rws *WriteStorage) AppenderV2(context.Context) storage.AppenderV2 {
+	return &timestampTrackerV2{
+		baseTimestampTracker: baseTimestampTracker{
+			writeStorage:         rws,
+			highestRecvTimestamp: rws.highestTimestamp,
+		},
 	}
 }
 
@@ -263,16 +326,35 @@ func (rws *WriteStorage) Close() error {
 		q.Stop()
 	}
 	close(rws.quit)
+
+	rws.watcherMetrics.Unregister()
+	rws.liveReaderMetrics.Unregister()
+
+	if rws.reg != nil {
+		rws.reg.Unregister(rws.highestTimestamp.Gauge)
+	}
+
 	return nil
 }
 
-type timestampTracker struct {
-	writeStorage         *WriteStorage
+type baseTimestampTracker struct {
+	writeStorage *WriteStorage
+
 	samples              int64
 	exemplars            int64
 	histograms           int64
 	highestTimestamp     int64
 	highestRecvTimestamp *maxTimestamp
+}
+
+type timestampTracker struct {
+	baseTimestampTracker
+
+	appendOptions *storage.AppendOptions
+}
+
+func (t *timestampTracker) SetOptions(opts *storage.AppendOptions) {
+	t.appendOptions = opts
 }
 
 // Append implements storage.Appender.
@@ -284,7 +366,8 @@ func (t *timestampTracker) Append(_ storage.SeriesRef, _ labels.Labels, ts int64
 	return 0, nil
 }
 
-func (t *timestampTracker) AppendExemplar(_ storage.SeriesRef, _ labels.Labels, _ exemplar.Exemplar) (storage.SeriesRef, error) {
+func (t *timestampTracker) AppendExemplar(storage.SeriesRef, labels.Labels, exemplar.Exemplar) (storage.SeriesRef, error) {
+	// highestTimestamp excludes exemplars, as not all queues send them.
 	t.exemplars++
 	return 0, nil
 }
@@ -297,19 +380,35 @@ func (t *timestampTracker) AppendHistogram(_ storage.SeriesRef, _ labels.Labels,
 	return 0, nil
 }
 
-func (t *timestampTracker) UpdateMetadata(_ storage.SeriesRef, _ labels.Labels, _ metadata.Metadata) (storage.SeriesRef, error) {
-	// TODO: Add and increment a `metadata` field when we get around to wiring metadata in remote_write.
-	// UpadteMetadata is no-op for remote write (where timestampTracker is being used) for now.
+func (t *timestampTracker) AppendSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, st int64) (storage.SeriesRef, error) {
+	t.samples++
+	if st > t.highestTimestamp {
+		// Theoretically, we should never see a ST zero sample with a timestamp higher than the highest timestamp we've seen so far.
+		// However, we're not going to enforce that here, as it is not the responsibility of the tracker to enforce this.
+		t.highestTimestamp = st
+	}
 	return 0, nil
 }
 
-func (t *timestampTracker) AppendCTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, _ int64) (storage.SeriesRef, error) {
-	// AppendCTZeroSample is no-op for remote-write for now.
+func (t *timestampTracker) AppendHistogramSTZeroSample(_ storage.SeriesRef, _ labels.Labels, _, st int64, _ *histogram.Histogram, _ *histogram.FloatHistogram) (storage.SeriesRef, error) {
+	t.histograms++
+	if st > t.highestTimestamp {
+		// Theoretically, we should never see a ST zero sample with a timestamp higher than the highest timestamp we've seen so far.
+		// However, we're not going to enforce that here, as it is not the responsibility of the tracker to enforce this.
+		t.highestTimestamp = st
+	}
+	return 0, nil
+}
+
+func (*timestampTracker) UpdateMetadata(storage.SeriesRef, labels.Labels, metadata.Metadata) (storage.SeriesRef, error) {
+	// Intentionally a no-op. dataIn measures records that create work for the
+	// sharded queue and is used to estimate queue load and backlog. A metadata
+	// update only changes cached per-series state; it does not enqueue an item.
 	return 0, nil
 }
 
 // Commit implements storage.Appender.
-func (t *timestampTracker) Commit() error {
+func (t *baseTimestampTracker) Commit() error {
 	t.writeStorage.samplesIn.incr(t.samples + t.exemplars + t.histograms)
 
 	samplesIn.Add(float64(t.samples))
@@ -320,6 +419,34 @@ func (t *timestampTracker) Commit() error {
 }
 
 // Rollback implements storage.Appender.
-func (*timestampTracker) Rollback() error {
+func (*baseTimestampTracker) Rollback() error {
 	return nil
 }
+
+type timestampTrackerV2 struct {
+	baseTimestampTracker
+}
+
+// Append implements storage.AppenderV2.
+func (t *timestampTrackerV2) Append(ref storage.SeriesRef, _ labels.Labels, _, ts int64, _ float64, h *histogram.Histogram, fh *histogram.FloatHistogram, opts storage.AOptions) (storage.SeriesRef, error) {
+	switch {
+	case fh != nil, h != nil:
+		t.histograms++
+	default:
+		t.samples++
+	}
+	if ts > t.highestTimestamp {
+		t.highestTimestamp = ts
+	}
+	t.exemplars += int64(len(opts.Exemplars))
+	return ref, nil
+}
+
+// AppendExemplars implements storage.ExemplarAppenderV2.
+func (t *timestampTrackerV2) AppendExemplars(ref storage.SeriesRef, _ labels.Labels, exemplars []exemplar.Exemplar) (storage.SeriesRef, error) {
+	// highestTimestamp excludes exemplars, as not all queues send them.
+	t.exemplars += int64(len(exemplars))
+	return ref, nil
+}
+
+var _ storage.ExemplarAppenderV2 = &timestampTrackerV2{}

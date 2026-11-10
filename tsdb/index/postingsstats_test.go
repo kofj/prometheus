@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,10 +20,10 @@ import (
 
 func TestPostingsStats(t *testing.T) {
 	stats := &maxHeap{}
-	max := 3000000
-	heapLength := 10
+	const maxCount = 3000000
+	const heapLength = 10
 	stats.init(heapLength)
-	for i := 0; i < max; i++ {
+	for i := range maxCount {
 		item := Stat{
 			Name:  "Label-da",
 			Count: uint64(i),
@@ -34,14 +34,14 @@ func TestPostingsStats(t *testing.T) {
 
 	data := stats.get()
 	require.Len(t, data, 10)
-	for i := 0; i < heapLength; i++ {
-		require.Equal(t, uint64(max-i), data[i].Count)
+	for i := range heapLength {
+		require.Equal(t, uint64(maxCount-i), data[i].Count)
 	}
 }
 
 func TestPostingsStats2(t *testing.T) {
 	stats := &maxHeap{}
-	heapLength := 10
+	const heapLength = 10
 
 	stats.init(heapLength)
 	stats.push(Stat{Name: "Stuff", Count: 10})
@@ -57,12 +57,12 @@ func TestPostingsStats2(t *testing.T) {
 
 func BenchmarkPostingStatsMaxHep(b *testing.B) {
 	stats := &maxHeap{}
-	max := 9000000
-	heapLength := 10
-	b.ResetTimer()
-	for n := 0; n < b.N; n++ {
+	const maxCount = 9000000
+	const heapLength = 10
+
+	for b.Loop() {
 		stats.init(heapLength)
-		for i := 0; i < max; i++ {
+		for i := range maxCount {
 			item := Stat{
 				Name:  "Label-da",
 				Count: uint64(i),

@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -26,9 +26,43 @@ import (
 
 func TestJsonCodec_Encode(t *testing.T) {
 	cases := []struct {
-		response interface{}
+		response any
 		expected string
 	}{
+		{
+			response: &QueryData{
+				ResultType: parser.ValueTypeVector,
+				Result: promql.Vector{
+					promql.Sample{
+						Metric: labels.FromStrings("__name__", "foo"),
+						T:      1000,
+						F:      1,
+					},
+					promql.Sample{
+						Metric: labels.FromStrings("__name__", "bar"),
+						T:      2000,
+						F:      2,
+					},
+				},
+			},
+			expected: `{"status":"success","data":{"resultType":"vector","result":[{"metric":{"__name__":"foo"},"value":[1,"1"]},{"metric":{"__name__":"bar"},"value":[2,"2"]}]}}`,
+		},
+		{
+			response: &QueryData{
+				ResultType: parser.ValueTypeMatrix,
+				Result: promql.Matrix{
+					promql.Series{
+						Metric: labels.FromStrings("__name__", "foo"),
+						Floats: []promql.FPoint{{F: 1, T: 1000}},
+					},
+					promql.Series{
+						Metric: labels.FromStrings("__name__", "bar"),
+						Floats: []promql.FPoint{{F: 2, T: 2000}},
+					},
+				},
+			},
+			expected: `{"status":"success","data":{"resultType":"matrix","result":[{"metric":{"__name__":"foo"},"values":[[1,"1"]]},{"metric":{"__name__":"bar"},"values":[[2,"2"]]}]}}`,
+		},
 		{
 			response: &QueryData{
 				ResultType: parser.ValueTypeMatrix,

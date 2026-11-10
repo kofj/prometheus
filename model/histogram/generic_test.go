@@ -1,4 +1,4 @@
-// Copyright 2022 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,7 +21,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestGetBound(t *testing.T) {
+func TestGetBoundExponential(t *testing.T) {
 	scenarios := []struct {
 		idx    int32
 		schema int32
@@ -105,10 +105,76 @@ func TestGetBound(t *testing.T) {
 	}
 
 	for _, s := range scenarios {
-		got := getBound(s.idx, s.schema)
+		got := getBoundExponential(s.idx, s.schema)
 		if s.want != got {
 			require.Equal(t, s.want, got, "idx %d, schema %d", s.idx, s.schema)
 		}
+	}
+}
+
+func TestBucketFractionBelow(t *testing.T) {
+	scenarios := []struct {
+		name   string
+		bucket Bucket[float64]
+		v      float64
+		linear bool
+		want   float64
+	}{
+		{
+			name:   "linear, midpoint",
+			bucket: Bucket[float64]{Lower: 0, Upper: 10, Count: 100},
+			v:      5,
+			linear: true,
+			want:   0.5,
+		},
+		{
+			name:   "linear, quarter",
+			bucket: Bucket[float64]{Lower: 2, Upper: 6, Count: 100},
+			v:      3,
+			linear: true,
+			want:   0.25,
+		},
+		{
+			name:   "linear, negative bucket",
+			bucket: Bucket[float64]{Lower: -10, Upper: -5, Count: 100},
+			v:      -6,
+			linear: true,
+			want:   0.8,
+		},
+		{
+			name:   "exponential, positive bucket at geometric midpoint",
+			bucket: Bucket[float64]{Lower: 2, Upper: 8, Count: 100},
+			v:      4,
+			linear: false,
+			want:   0.5,
+		},
+		{
+			name:   "exponential, positive bucket lower quarter of log scale",
+			bucket: Bucket[float64]{Lower: 1, Upper: 16, Count: 100},
+			v:      2,
+			linear: false,
+			want:   0.25,
+		},
+		{
+			name:   "exponential, negative bucket at geometric midpoint",
+			bucket: Bucket[float64]{Lower: -8, Upper: -2, Count: 100},
+			v:      -4,
+			linear: false,
+			want:   0.5,
+		},
+		{
+			name:   "exponential, negative bucket",
+			bucket: Bucket[float64]{Lower: -4, Upper: -2, Count: 100},
+			v:      -3,
+			linear: false,
+			want:   0.41503749927884383,
+		},
+	}
+
+	for _, s := range scenarios {
+		t.Run(s.name, func(t *testing.T) {
+			require.InDelta(t, s.want, s.bucket.FractionBelow(s.v, s.linear), 1e-12)
+		})
 	}
 }
 
@@ -142,7 +208,7 @@ func TestReduceResolutionHistogram(t *testing.T) {
 
 	for _, tc := range cases {
 		spansCopy, bucketsCopy := slices.Clone(tc.spans), slices.Clone(tc.buckets)
-		spans, buckets := reduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, true, false)
+		spans, buckets := mustReduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, true, false)
 		require.Equal(t, tc.expectedSpans, spans)
 		require.Equal(t, tc.expectedBuckets, buckets)
 		// Verify inputs were not mutated:
@@ -151,7 +217,7 @@ func TestReduceResolutionHistogram(t *testing.T) {
 
 		// Output slices reuse input slices:
 		const inplace = true
-		spans, buckets = reduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, true, inplace)
+		spans, buckets = mustReduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, true, inplace)
 		require.Equal(t, tc.expectedSpans, spans)
 		require.Equal(t, tc.expectedBuckets, buckets)
 		// Verify inputs were mutated which is now expected:
@@ -190,7 +256,7 @@ func TestReduceResolutionFloatHistogram(t *testing.T) {
 
 	for _, tc := range cases {
 		spansCopy, bucketsCopy := slices.Clone(tc.spans), slices.Clone(tc.buckets)
-		spans, buckets := reduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, false, false)
+		spans, buckets := mustReduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, false, false)
 		require.Equal(t, tc.expectedSpans, spans)
 		require.Equal(t, tc.expectedBuckets, buckets)
 		// Verify inputs were not mutated:
@@ -199,11 +265,79 @@ func TestReduceResolutionFloatHistogram(t *testing.T) {
 
 		// Output slices reuse input slices:
 		const inplace = true
-		spans, buckets = reduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, false, inplace)
+		spans, buckets = mustReduceResolution(tc.spans, tc.buckets, tc.schema, tc.targetSchema, false, inplace)
 		require.Equal(t, tc.expectedSpans, spans)
 		require.Equal(t, tc.expectedBuckets, buckets)
 		// Verify inputs were mutated which is now expected:
 		require.Equal(t, spans, tc.spans[:len(spans)])
 		require.Equal(t, buckets, tc.buckets[:len(buckets)])
+	}
+}
+
+func TestCustomBucketBoundsMatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		c1, c2 []float64
+		want   bool
+	}{
+		{
+			name: "both nil",
+			c1:   nil,
+			c2:   nil,
+			want: true,
+		},
+		{
+			name: "both empty",
+			c1:   []float64{},
+			c2:   []float64{},
+			want: true,
+		},
+		{
+			name: "one empty one non-empty",
+			c1:   []float64{},
+			c2:   []float64{1.0},
+			want: false,
+		},
+		{
+			name: "different lengths",
+			c1:   []float64{1.0, 2.0},
+			c2:   []float64{1.0, 2.0, 3.0},
+			want: false,
+		},
+		{
+			name: "same single value",
+			c1:   []float64{1.5},
+			c2:   []float64{1.5},
+			want: true,
+		},
+		{
+			name: "different single value",
+			c1:   []float64{1.5},
+			c2:   []float64{2.5},
+			want: false,
+		},
+		{
+			name: "same multiple values",
+			c1:   []float64{1.0, 2.0, 3.0, 4.0, 5.0},
+			c2:   []float64{1.0, 2.0, 3.0, 4.0, 5.0},
+			want: true,
+		},
+		{
+			name: "different values",
+			c1:   []float64{1.0, 2.1, 3.0},
+			c2:   []float64{1.0, 2.0, 3.0},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CustomBucketBoundsMatch(tt.c1, tt.c2)
+			require.Equal(t, tt.want, got)
+
+			// Test commutativity (should be symmetric)
+			gotReverse := CustomBucketBoundsMatch(tt.c2, tt.c1)
+			require.Equal(t, got, gotReverse)
+		})
 	}
 }

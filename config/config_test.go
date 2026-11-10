@@ -1,4 +1,4 @@
-// Copyright 2015 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,7 @@ package config
 
 import (
 	"crypto/tls"
-	"encoding/json"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,12 +23,16 @@ import (
 	"time"
 
 	"github.com/alecthomas/units"
-	"github.com/go-kit/log"
+	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/grafana/regexp"
+	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
+	"github.com/prometheus/otlptranslator"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/discovery/aws"
@@ -46,10 +50,13 @@ import (
 	"github.com/prometheus/prometheus/discovery/marathon"
 	"github.com/prometheus/prometheus/discovery/moby"
 	"github.com/prometheus/prometheus/discovery/nomad"
+	"github.com/prometheus/prometheus/discovery/oci"
 	"github.com/prometheus/prometheus/discovery/openstack"
+	"github.com/prometheus/prometheus/discovery/outscale"
 	"github.com/prometheus/prometheus/discovery/ovhcloud"
 	"github.com/prometheus/prometheus/discovery/puppetdb"
 	"github.com/prometheus/prometheus/discovery/scaleway"
+	"github.com/prometheus/prometheus/discovery/stackit"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/discovery/triton"
 	"github.com/prometheus/prometheus/discovery/uyuni"
@@ -76,24 +83,38 @@ const (
 	globLabelLimit            = 30
 	globLabelNameLengthLimit  = 200
 	globLabelValueLengthLimit = 200
+	globalGoGC                = 42
 )
 
+var globScrapeFailureLogFile = filepath.FromSlash("testdata/fail.log")
+
 var expectedConf = &Config{
+	loaded: true,
 	GlobalConfig: GlobalConfig{
-		ScrapeInterval:     model.Duration(15 * time.Second),
-		ScrapeTimeout:      DefaultGlobalConfig.ScrapeTimeout,
-		EvaluationInterval: model.Duration(30 * time.Second),
-		QueryLogFile:       "",
+		ScrapeInterval:       model.Duration(15 * time.Second),
+		ScrapeTimeout:        DefaultGlobalConfig.ScrapeTimeout,
+		EvaluationInterval:   model.Duration(30 * time.Second),
+		QueryLogFile:         filepath.FromSlash("testdata/query.log"),
+		ScrapeFailureLogFile: globScrapeFailureLogFile,
 
 		ExternalLabels: labels.FromStrings("foo", "bar", "monitor", "codelab"),
 
-		BodySizeLimit:         globBodySizeLimit,
-		SampleLimit:           globSampleLimit,
-		TargetLimit:           globTargetLimit,
-		LabelLimit:            globLabelLimit,
-		LabelNameLengthLimit:  globLabelNameLengthLimit,
-		LabelValueLengthLimit: globLabelValueLengthLimit,
-		ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+		BodySizeLimit:                  globBodySizeLimit,
+		SampleLimit:                    globSampleLimit,
+		TargetLimit:                    globTargetLimit,
+		LabelLimit:                     globLabelLimit,
+		LabelNameLengthLimit:           globLabelNameLengthLimit,
+		LabelValueLengthLimit:          globLabelValueLengthLimit,
+		ScrapeNativeHistograms:         boolPtr(false),
+		AlwaysScrapeClassicHistograms:  false,
+		ConvertClassicHistogramsToNHCB: false,
+		ExtraScrapeMetrics:             boolPtr(false),
+		MetricNameValidationScheme:     model.UTF8Validation,
+	},
+
+	Runtime: RuntimeConfig{
+		GoGC:     globalGoGC,
+		LogLevel: LogLevel("info"),
 	},
 
 	RuleFiles: []string{
@@ -103,16 +124,18 @@ var expectedConf = &Config{
 
 	RemoteWriteConfigs: []*RemoteWriteConfig{
 		{
-			URL:           mustParseURL("http://remote1/push"),
-			RemoteTimeout: model.Duration(30 * time.Second),
-			Name:          "drop_expensive",
+			URL:             mustParseURL("http://remote1/push"),
+			ProtobufMessage: remoteapi.WriteV1MessageType,
+			RemoteTimeout:   model.Duration(30 * time.Second),
+			Name:            "drop_expensive",
 			WriteRelabelConfigs: []*relabel.Config{
 				{
-					SourceLabels: model.LabelNames{"__name__"},
-					Separator:    ";",
-					Regex:        relabel.MustNewRegexp("expensive.*"),
-					Replacement:  "$1",
-					Action:       relabel.Drop,
+					SourceLabels:         model.LabelNames{"__name__"},
+					Separator:            ";",
+					Regex:                relabel.MustNewRegexp("expensive.*"),
+					Replacement:          "$1",
+					Action:               relabel.Drop,
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 			QueueConfig:    DefaultQueueConfig,
@@ -128,33 +151,45 @@ var expectedConf = &Config{
 					},
 				},
 				FollowRedirects: true,
-				EnableHTTP2:     true,
+				EnableHTTP2:     false,
 			},
 		},
 		{
-			URL:            mustParseURL("http://remote2/push"),
-			RemoteTimeout:  model.Duration(30 * time.Second),
-			QueueConfig:    DefaultQueueConfig,
-			MetadataConfig: DefaultMetadataConfig,
-			Name:           "rw_tls",
+			URL:             mustParseURL("http://remote2/push"),
+			ProtobufMessage: remoteapi.WriteV2MessageType,
+			RemoteTimeout:   model.Duration(30 * time.Second),
+			QueueConfig:     DefaultQueueConfig,
+			MetadataConfig:  DefaultMetadataConfig,
+			Name:            "rw_tls",
 			HTTPClientConfig: config.HTTPClientConfig{
 				TLSConfig: config.TLSConfig{
 					CertFile: filepath.FromSlash("testdata/valid_cert_file"),
 					KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 				},
 				FollowRedirects: true,
-				EnableHTTP2:     true,
+				EnableHTTP2:     false,
 			},
-			Headers: map[string]string{"name": "value"},
+			Headers:              map[string]string{"name": "value"},
+			ConvertNHCBToClassic: true,
 		},
+	},
+
+	OTLPConfig: OTLPConfig{
+		PromoteResourceAttributes: []string{
+			"k8s.cluster.name", "k8s.job.name", "k8s.namespace.name",
+		},
+		TranslationStrategy:                  otlptranslator.UnderscoreEscapingWithSuffixes,
+		LabelNameUnderscoreSanitization:      true,
+		LabelNamePreserveMultipleUnderscores: true,
 	},
 
 	RemoteReadConfigs: []*RemoteReadConfig{
 		{
-			URL:           mustParseURL("http://remote1/read"),
-			RemoteTimeout: model.Duration(1 * time.Minute),
-			ReadRecent:    true,
-			Name:          "default",
+			URL:              mustParseURL("http://remote1/read"),
+			RemoteTimeout:    model.Duration(1 * time.Minute),
+			ChunkedReadLimit: DefaultChunkedReadLimit,
+			ReadRecent:       true,
+			Name:             "default",
 			HTTPClientConfig: config.HTTPClientConfig{
 				FollowRedirects: true,
 				EnableHTTP2:     false,
@@ -164,6 +199,7 @@ var expectedConf = &Config{
 		{
 			URL:              mustParseURL("http://remote3/read"),
 			RemoteTimeout:    model.Duration(1 * time.Minute),
+			ChunkedReadLimit: DefaultChunkedReadLimit,
 			ReadRecent:       false,
 			Name:             "read_special",
 			RequiredMatchers: model.LabelSet{"job": "special"},
@@ -183,18 +219,26 @@ var expectedConf = &Config{
 		{
 			JobName: "prometheus",
 
-			HonorLabels:           true,
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorLabels:                    true,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFallbackProtocol:         PrometheusText0_0_4,
+			ScrapeFailureLogFile:           filepath.FromSlash("testdata/fail_prom.log"),
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
@@ -209,15 +253,28 @@ var expectedConf = &Config{
 				TLSConfig: config.TLSConfig{
 					MinVersion: config.TLSVersion(tls.VersionTLS10),
 				},
+				HTTPHeaders: &config.Headers{
+					Headers: map[string]config.Header{
+						"foo": {
+							Values:  []string{"foobar"},
+							Secrets: []config.Secret{"bar", "foo"},
+							Files:   []string{filepath.FromSlash("testdata/valid_password_file")},
+						},
+					},
+				},
 			},
 
 			ServiceDiscoveryConfigs: discovery.Configs{
 				&file.SDConfig{
-					Files:           []string{"testdata/foo/*.slow.json", "testdata/foo/*.slow.yml", "testdata/single/file.yml"},
+					Files: []string{
+						filepath.FromSlash("testdata/foo/*.slow.json"),
+						filepath.FromSlash("testdata/foo/*.slow.yml"),
+						filepath.FromSlash("testdata/single/file.yml"),
+					},
 					RefreshInterval: model.Duration(10 * time.Minute),
 				},
 				&file.SDConfig{
-					Files:           []string{"testdata/bar/*.yaml"},
+					Files:           []string{filepath.FromSlash("testdata/bar/*.yaml")},
 					RefreshInterval: model.Duration(5 * time.Minute),
 				},
 				discovery.StaticConfig{
@@ -237,67 +294,80 @@ var expectedConf = &Config{
 
 			RelabelConfigs: []*relabel.Config{
 				{
-					SourceLabels: model.LabelNames{"job", "__meta_dns_name"},
-					TargetLabel:  "job",
-					Separator:    ";",
-					Regex:        relabel.MustNewRegexp("(.*)some-[regex]"),
-					Replacement:  "foo-${1}",
-					Action:       relabel.Replace,
+					SourceLabels:         model.LabelNames{"job", "__meta_dns_name"},
+					TargetLabel:          "job",
+					Separator:            ";",
+					Regex:                relabel.MustNewRegexp("(.*)some-[regex]"),
+					Replacement:          "foo-${1}",
+					Action:               relabel.Replace,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					SourceLabels: model.LabelNames{"abc"},
-					TargetLabel:  "cde",
-					Separator:    ";",
-					Regex:        relabel.DefaultRelabelConfig.Regex,
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Action:       relabel.Replace,
+					SourceLabels:         model.LabelNames{"abc"},
+					TargetLabel:          "cde",
+					Separator:            ";",
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.Replace,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					TargetLabel: "abc",
-					Separator:   ";",
-					Regex:       relabel.DefaultRelabelConfig.Regex,
-					Replacement: "static",
-					Action:      relabel.Replace,
+					TargetLabel:          "abc",
+					Separator:            ";",
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          "static",
+					Action:               relabel.Replace,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					TargetLabel: "abc",
-					Separator:   ";",
-					Regex:       relabel.MustNewRegexp(""),
-					Replacement: "static",
-					Action:      relabel.Replace,
+					TargetLabel:          "abc",
+					Separator:            ";",
+					Regex:                relabel.MustNewRegexp(""),
+					Replacement:          "static",
+					Action:               relabel.Replace,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					SourceLabels: model.LabelNames{"foo"},
-					TargetLabel:  "abc",
-					Action:       relabel.KeepEqual,
-					Regex:        relabel.DefaultRelabelConfig.Regex,
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Separator:    relabel.DefaultRelabelConfig.Separator,
+					SourceLabels:         model.LabelNames{"foo"},
+					TargetLabel:          "abc",
+					Action:               relabel.KeepEqual,
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Separator:            relabel.DefaultRelabelConfig.Separator,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					SourceLabels: model.LabelNames{"foo"},
-					TargetLabel:  "abc",
-					Action:       relabel.DropEqual,
-					Regex:        relabel.DefaultRelabelConfig.Regex,
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Separator:    relabel.DefaultRelabelConfig.Separator,
+					SourceLabels:         model.LabelNames{"foo"},
+					TargetLabel:          "abc",
+					Action:               relabel.DropEqual,
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Separator:            relabel.DefaultRelabelConfig.Separator,
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 		},
 		{
 			JobName: "service-x",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(50 * time.Second),
-			ScrapeTimeout:         model.Duration(5 * time.Second),
-			EnableCompression:     true,
-			BodySizeLimit:         10 * units.MiB,
-			SampleLimit:           1000,
-			TargetLimit:           35,
-			LabelLimit:            35,
-			LabelNameLengthLimit:  210,
-			LabelValueLengthLimit: 210,
-			ScrapeProtocols:       []ScrapeProtocol{PrometheusText0_0_4},
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(50 * time.Second),
+			ScrapeTimeout:                  model.Duration(5 * time.Second),
+			EnableCompression:              true,
+			BodySizeLimit:                  10 * units.MiB,
+			SampleLimit:                    1000,
+			TargetLimit:                    35,
+			LabelLimit:                     35,
+			LabelNameLengthLimit:           210,
+			LabelValueLengthLimit:          210,
+			ScrapeProtocols:                []ScrapeProtocol{PrometheusText0_0_4},
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			HTTPClientConfig: config.HTTPClientConfig{
 				BasicAuth: &config.BasicAuth{
@@ -330,71 +400,85 @@ var expectedConf = &Config{
 
 			RelabelConfigs: []*relabel.Config{
 				{
-					SourceLabels: model.LabelNames{"job"},
-					Regex:        relabel.MustNewRegexp("(.*)some-[regex]"),
-					Separator:    ";",
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Action:       relabel.Drop,
+					SourceLabels:         model.LabelNames{"job"},
+					Regex:                relabel.MustNewRegexp("(.*)some-[regex]"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.Drop,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					SourceLabels: model.LabelNames{"__address__"},
-					TargetLabel:  "__tmp_hash",
-					Regex:        relabel.DefaultRelabelConfig.Regex,
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Modulus:      8,
-					Separator:    ";",
-					Action:       relabel.HashMod,
+					SourceLabels:         model.LabelNames{"__address__"},
+					TargetLabel:          "__tmp_hash",
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Modulus:              8,
+					Separator:            ";",
+					Action:               relabel.HashMod,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					SourceLabels: model.LabelNames{"__tmp_hash"},
-					Regex:        relabel.MustNewRegexp("1"),
-					Separator:    ";",
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Action:       relabel.Keep,
+					SourceLabels:         model.LabelNames{"__tmp_hash"},
+					Regex:                relabel.MustNewRegexp("1"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.Keep,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					Regex:       relabel.MustNewRegexp("1"),
-					Separator:   ";",
-					Replacement: relabel.DefaultRelabelConfig.Replacement,
-					Action:      relabel.LabelMap,
+					Regex:                relabel.MustNewRegexp("1"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.LabelMap,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					Regex:       relabel.MustNewRegexp("d"),
-					Separator:   ";",
-					Replacement: relabel.DefaultRelabelConfig.Replacement,
-					Action:      relabel.LabelDrop,
+					Regex:                relabel.MustNewRegexp("d"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.LabelDrop,
+					NameValidationScheme: model.UTF8Validation,
 				},
 				{
-					Regex:       relabel.MustNewRegexp("k"),
-					Separator:   ";",
-					Replacement: relabel.DefaultRelabelConfig.Replacement,
-					Action:      relabel.LabelKeep,
+					Regex:                relabel.MustNewRegexp("k"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.LabelKeep,
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 			MetricRelabelConfigs: []*relabel.Config{
 				{
-					SourceLabels: model.LabelNames{"__name__"},
-					Regex:        relabel.MustNewRegexp("expensive_metric.*"),
-					Separator:    ";",
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Action:       relabel.Drop,
+					SourceLabels:         model.LabelNames{"__name__"},
+					Regex:                relabel.MustNewRegexp("expensive_metric.*"),
+					Separator:            ";",
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Action:               relabel.Drop,
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 		},
 		{
 			JobName: "service-y",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -406,6 +490,7 @@ var expectedConf = &Config{
 					PathPrefix:      "/consul",
 					Token:           "mysecret",
 					Services:        []string{"nginx", "cache", "mysql"},
+					HealthFilter:    `Service.Tags contains "canary"`,
 					ServiceTags:     []string{"canary", "v1"},
 					NodeMeta:        map[string]string{"rack": "123"},
 					TagSeparator:    consul.DefaultSDConfig.TagSeparator,
@@ -427,29 +512,37 @@ var expectedConf = &Config{
 
 			RelabelConfigs: []*relabel.Config{
 				{
-					SourceLabels: model.LabelNames{"__meta_sd_consul_tags"},
-					Regex:        relabel.MustNewRegexp("label:([^=]+)=([^,]+)"),
-					Separator:    ",",
-					TargetLabel:  "${1}",
-					Replacement:  "${2}",
-					Action:       relabel.Replace,
+					SourceLabels:         model.LabelNames{"__meta_sd_consul_tags"},
+					Regex:                relabel.MustNewRegexp("label:([^=]+)=([^,]+)"),
+					Separator:            ",",
+					TargetLabel:          "${1}",
+					Replacement:          "${2}",
+					Action:               relabel.Replace,
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 		},
 		{
 			JobName: "service-z",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         model.Duration(10 * time.Second),
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  model.Duration(10 * time.Second),
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath: "/metrics",
 			Scheme:      "http",
@@ -472,17 +565,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-kubernetes",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -511,17 +611,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-kubernetes-namespaces",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath: DefaultScrapeConfig.MetricsPath,
 			Scheme:      DefaultScrapeConfig.Scheme,
@@ -550,17 +657,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-kuma",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -579,17 +693,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-marathon",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -616,17 +737,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-nomad",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -650,17 +778,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-ec2",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -674,7 +809,7 @@ var expectedConf = &Config{
 					Profile:         "profile",
 					RefreshInterval: model.Duration(60 * time.Second),
 					Port:            80,
-					Filters: []*aws.EC2Filter{
+					Filters: []*aws.Filter{
 						{
 							Name:   "tag:environment",
 							Values: []string{"prod"},
@@ -691,17 +826,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-lightsail",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -722,17 +864,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-azure",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -756,17 +905,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-nerve",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -783,17 +939,24 @@ var expectedConf = &Config{
 		{
 			JobName: "0123service-xxx",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -813,17 +976,24 @@ var expectedConf = &Config{
 		{
 			JobName: "badfederation",
 
-			HonorTimestamps:       false,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                false,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      "/federate",
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -843,17 +1013,24 @@ var expectedConf = &Config{
 		{
 			JobName: "測試",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -873,17 +1050,24 @@ var expectedConf = &Config{
 		{
 			JobName: "httpsd",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -900,17 +1084,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-triton",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -926,8 +1117,8 @@ var expectedConf = &Config{
 					RefreshInterval: model.Duration(60 * time.Second),
 					Version:         1,
 					TLSConfig: config.TLSConfig{
-						CertFile: "testdata/valid_cert_file",
-						KeyFile:  "testdata/valid_key_file",
+						CertFile: filepath.FromSlash("testdata/valid_cert_file"),
+						KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 					},
 				},
 			},
@@ -935,17 +1126,24 @@ var expectedConf = &Config{
 		{
 			JobName: "digitalocean-droplets",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -963,23 +1161,31 @@ var expectedConf = &Config{
 					},
 					Port:            80,
 					RefreshInterval: model.Duration(60 * time.Second),
+					Role:            "droplets",
 				},
 			},
 		},
 		{
 			JobName: "docker",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -993,23 +1199,31 @@ var expectedConf = &Config{
 					HostNetworkingHost: "localhost",
 					RefreshInterval:    model.Duration(60 * time.Second),
 					HTTPClientConfig:   config.DefaultHTTPClientConfig,
+					MatchFirstNetwork:  true,
 				},
 			},
 		},
 		{
 			JobName: "dockerswarm",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1027,19 +1241,68 @@ var expectedConf = &Config{
 			},
 		},
 		{
+			JobName: "service-oci",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&oci.SDConfig{
+					Auth:             "api_key",
+					Region:           "us-ashburn-1",
+					Tenancy:          "ocid1.tenancy.oc1..tenancy001",
+					User:             "ocid1.user.oc1..user001",
+					Fingerprint:      "aa:bb:cc:dd:ee:ff",
+					KeyFile:          filepath.FromSlash("testdata/valid_key_file"),
+					KeyPassphrase:    "mysecret",
+					Compartments:     []string{"ocid1.compartment.oc1..comp001"},
+					Port:             9100,
+					RefreshInterval:  model.Duration(60 * time.Second),
+					HTTPClientConfig: config.DefaultHTTPClientConfig,
+				},
+			},
+		},
+		{
 			JobName: "service-openstack",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1053,9 +1316,9 @@ var expectedConf = &Config{
 					Availability:    "public",
 					RefreshInterval: model.Duration(60 * time.Second),
 					TLSConfig: config.TLSConfig{
-						CAFile:   "testdata/valid_ca_file",
-						CertFile: "testdata/valid_cert_file",
-						KeyFile:  "testdata/valid_key_file",
+						CAFile:   filepath.FromSlash("testdata/valid_ca_file"),
+						CertFile: filepath.FromSlash("testdata/valid_cert_file"),
+						KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 					},
 				},
 			},
@@ -1063,17 +1326,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-puppetdb",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1090,27 +1360,34 @@ var expectedConf = &Config{
 						FollowRedirects: true,
 						EnableHTTP2:     true,
 						TLSConfig: config.TLSConfig{
-							CAFile:   "testdata/valid_ca_file",
-							CertFile: "testdata/valid_cert_file",
-							KeyFile:  "testdata/valid_key_file",
+							CAFile:   filepath.FromSlash("testdata/valid_ca_file"),
+							CertFile: filepath.FromSlash("testdata/valid_cert_file"),
+							KeyFile:  filepath.FromSlash("testdata/valid_key_file"),
 						},
 					},
 				},
 			},
 		},
 		{
-			JobName:               "hetzner",
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			JobName:                        "hetzner",
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultProtoFirstScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(true),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1118,12 +1395,13 @@ var expectedConf = &Config{
 
 			RelabelConfigs: []*relabel.Config{
 				{
-					Action:       relabel.Uppercase,
-					Regex:        relabel.DefaultRelabelConfig.Regex,
-					Replacement:  relabel.DefaultRelabelConfig.Replacement,
-					Separator:    relabel.DefaultRelabelConfig.Separator,
-					SourceLabels: model.LabelNames{"instance"},
-					TargetLabel:  "instance",
+					Action:               relabel.Uppercase,
+					Regex:                relabel.DefaultRelabelConfig.Regex,
+					Replacement:          relabel.DefaultRelabelConfig.Replacement,
+					Separator:            relabel.DefaultRelabelConfig.Separator,
+					SourceLabels:         model.LabelNames{"instance"},
+					TargetLabel:          "instance",
+					NameValidationScheme: model.UTF8Validation,
 				},
 			},
 
@@ -1156,17 +1434,24 @@ var expectedConf = &Config{
 		{
 			JobName: "service-eureka",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1183,17 +1468,24 @@ var expectedConf = &Config{
 		{
 			JobName: "ovhcloud",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			HTTPClientConfig: config.DefaultHTTPClientConfig,
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
@@ -1221,17 +1513,24 @@ var expectedConf = &Config{
 		{
 			JobName: "scaleway",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			HTTPClientConfig: config.DefaultHTTPClientConfig,
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
@@ -1265,17 +1564,24 @@ var expectedConf = &Config{
 		{
 			JobName: "linode-instances",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1298,19 +1604,69 @@ var expectedConf = &Config{
 			},
 		},
 		{
+			JobName:                        "stackit-servers",
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&stackit.SDConfig{
+					Project:           "11111111-1111-1111-1111-111111111111",
+					ServiceAccountKey: "mysecret_sa_key",
+					PrivateKey:        "mysecret_private_key",
+					Region:            "eu01",
+					HTTPClientConfig: config.HTTPClientConfig{
+						Authorization: &config.Authorization{
+							Type:        "Bearer",
+							Credentials: "abcdef",
+						},
+						FollowRedirects: true,
+						EnableHTTP2:     true,
+					},
+					Port:            80,
+					RefreshInterval: model.Duration(60 * time.Second),
+				},
+			},
+		},
+		{
 			JobName: "uyuni",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			HTTPClientConfig: config.DefaultHTTPClientConfig,
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
@@ -1328,18 +1684,26 @@ var expectedConf = &Config{
 			},
 		},
 		{
-			JobName:               "ionos",
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			JobName: "ionos",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1361,17 +1725,24 @@ var expectedConf = &Config{
 		{
 			JobName: "vultr",
 
-			HonorTimestamps:       true,
-			ScrapeInterval:        model.Duration(15 * time.Second),
-			ScrapeTimeout:         DefaultGlobalConfig.ScrapeTimeout,
-			EnableCompression:     true,
-			BodySizeLimit:         globBodySizeLimit,
-			SampleLimit:           globSampleLimit,
-			TargetLimit:           globTargetLimit,
-			LabelLimit:            globLabelLimit,
-			LabelNameLengthLimit:  globLabelNameLengthLimit,
-			LabelValueLengthLimit: globLabelValueLengthLimit,
-			ScrapeProtocols:       DefaultGlobalConfig.ScrapeProtocols,
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
 
 			MetricsPath:      DefaultScrapeConfig.MetricsPath,
 			Scheme:           DefaultScrapeConfig.Scheme,
@@ -1389,6 +1760,44 @@ var expectedConf = &Config{
 					},
 					Port:            80,
 					RefreshInterval: model.Duration(60 * time.Second),
+				},
+			},
+		},
+		{
+			JobName: "outscale",
+
+			HonorTimestamps:                true,
+			ScrapeInterval:                 model.Duration(15 * time.Second),
+			ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+			EnableCompression:              true,
+			BodySizeLimit:                  globBodySizeLimit,
+			SampleLimit:                    globSampleLimit,
+			TargetLimit:                    globTargetLimit,
+			LabelLimit:                     globLabelLimit,
+			LabelNameLengthLimit:           globLabelNameLengthLimit,
+			LabelValueLengthLimit:          globLabelValueLengthLimit,
+			ScrapeProtocols:                DefaultScrapeProtocols,
+			ScrapeFailureLogFile:           globScrapeFailureLogFile,
+			MetricNameValidationScheme:     DefaultGlobalConfig.MetricNameValidationScheme,
+			MetricNameEscapingScheme:       DefaultGlobalConfig.MetricNameEscapingScheme,
+			ScrapeNativeHistograms:         boolPtr(false),
+			AlwaysScrapeClassicHistograms:  boolPtr(false),
+			ConvertClassicHistogramsToNHCB: boolPtr(false),
+			ExtraScrapeMetrics:             boolPtr(false),
+
+			MetricsPath:      DefaultScrapeConfig.MetricsPath,
+			Scheme:           DefaultScrapeConfig.Scheme,
+			HTTPClientConfig: config.DefaultHTTPClientConfig,
+
+			ServiceDiscoveryConfigs: discovery.Configs{
+				&outscale.SDConfig{
+					Endpoint:         "https://api.eu-west-2.outscale.com/api/v1",
+					Region:           "eu-west-2",
+					AccessKey:        "A1B2C3D4E5F6G7H8I9J0",
+					SecretKey:        "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+					Port:             80,
+					RefreshInterval:  model.Duration(60 * time.Second),
+					HTTPClientConfig: config.DefaultHTTPClientConfig,
 				},
 			},
 		},
@@ -1417,8 +1826,14 @@ var expectedConf = &Config{
 	},
 	StorageConfig: StorageConfig{
 		TSDBConfig: &TSDBConfig{
-			OutOfOrderTimeWindow:     30 * time.Minute.Milliseconds(),
-			OutOfOrderTimeWindowFlag: model.Duration(30 * time.Minute),
+			OutOfOrderTimeWindow:           30 * time.Minute.Milliseconds(),
+			OutOfOrderTimeWindowFlag:       model.Duration(30 * time.Minute),
+			StaleSeriesCompactionThreshold: 0.5,
+			Retention: &TSDBRetentionConfig{
+				Time:       model.Duration(24 * time.Hour),
+				Size:       1 * units.GiB,
+				Percentage: 28,
+			},
 		},
 	},
 	TracingConfig: TracingConfig{
@@ -1429,53 +1844,464 @@ var expectedConf = &Config{
 		Timeout:     model.Duration(5 * time.Second),
 		Headers:     map[string]string{"foo": "bar"},
 		TLSConfig: config.TLSConfig{
-			CertFile:           "testdata/valid_cert_file",
-			KeyFile:            "testdata/valid_key_file",
+			CertFile:           filepath.FromSlash("testdata/valid_cert_file"),
+			KeyFile:            filepath.FromSlash("testdata/valid_key_file"),
 			InsecureSkipVerify: true,
 		},
 	},
 }
 
+func TestYAMLNotLongerSupportedAMApi(t *testing.T) {
+	_, err := LoadFile("testdata/config_with_no_longer_supported_am_api_config.yml", false, promslog.NewNopLogger())
+	require.Error(t, err)
+}
+
 func TestYAMLRoundtrip(t *testing.T) {
-	want, err := LoadFile("testdata/roundtrip.good.yml", false, false, log.NewNopLogger())
+	want, err := LoadFile("testdata/roundtrip.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 
 	out, err := yaml.Marshal(want)
-
 	require.NoError(t, err)
-	got := &Config{}
-	require.NoError(t, yaml.UnmarshalStrict(out, got))
+
+	got, err := Load(string(out), promslog.NewNopLogger())
+	require.NoError(t, err)
 
 	require.Equal(t, want, got)
 }
 
+func TestQueryCostLimits(t *testing.T) {
+	t.Run("defaults are unlimited", func(t *testing.T) {
+		c, err := Load("", promslog.NewNopLogger())
+		require.NoError(t, err)
+		require.Zero(t, c.GlobalConfig.QueryMaxSeries)
+		require.Zero(t, c.GlobalConfig.QueryMaxSamplesRead)
+		require.Zero(t, c.GlobalConfig.QueryMaxDuration)
+
+		require.Zero(t, DefaultGlobalConfig.QueryMaxSeries)
+		require.Zero(t, DefaultGlobalConfig.QueryMaxSamplesRead)
+		require.Zero(t, DefaultGlobalConfig.QueryMaxDuration)
+	})
+
+	t.Run("explicit zero is unlimited", func(t *testing.T) {
+		c, err := Load("global:\n  query_max_series: 0\n  query_max_samples_read: 0\n  query_max_duration: 0s\n", promslog.NewNopLogger())
+		require.NoError(t, err)
+		require.Zero(t, c.GlobalConfig.QueryMaxSeries)
+		require.Zero(t, c.GlobalConfig.QueryMaxSamplesRead)
+		require.Zero(t, c.GlobalConfig.QueryMaxDuration)
+	})
+
+	t.Run("parses from file", func(t *testing.T) {
+		c, err := LoadFile("testdata/query_cost_limits.good.yml", false, promslog.NewNopLogger())
+		require.NoError(t, err)
+		require.Equal(t, uint64(1000000), c.GlobalConfig.QueryMaxSeries)
+		require.Equal(t, uint64(50000000), c.GlobalConfig.QueryMaxSamplesRead)
+		require.Equal(t, model.Duration(45*time.Second), c.GlobalConfig.QueryMaxDuration)
+	})
+
+	t.Run("round-trips through YAML", func(t *testing.T) {
+		want, err := LoadFile("testdata/query_cost_limits.good.yml", false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		require.Contains(t, string(out), "query_max_series: 1000000")
+		require.Contains(t, string(out), "query_max_samples_read: 50000000")
+		require.Contains(t, string(out), "query_max_duration: 45s")
+
+		got, err := Load(string(out), promslog.NewNopLogger())
+		require.NoError(t, err)
+		require.Equal(t, want, got)
+	})
+
+	t.Run("rejects bad values", func(t *testing.T) {
+		for _, tc := range []struct {
+			in     string
+			errMsg string
+		}{
+			{
+				in:     "global:\n  query_max_series: -1\n",
+				errMsg: "cannot unmarshal !!int `-1` into uint64",
+			},
+			{
+				in:     "global:\n  query_max_samples_read: -1\n",
+				errMsg: "cannot unmarshal !!int `-1` into uint64",
+			},
+			{
+				in:     "global:\n  query_max_duration: -1s\n",
+				errMsg: `not a valid duration string: "-1s"`,
+			},
+			{
+				in:     "global:\n  query_max_series: many\n",
+				errMsg: "cannot unmarshal !!str `many` into uint64",
+			},
+			{
+				in:     "global:\n  query_max_duration: 45\n",
+				errMsg: `not a valid duration string: "45"`,
+			},
+			{
+				in:     "global:\n  query_max_duration: forever\n",
+				errMsg: `not a valid duration string: "forever"`,
+			},
+		} {
+			t.Run(tc.in, func(t *testing.T) {
+				_, err := Load(tc.in, promslog.NewNopLogger())
+				require.ErrorContains(t, err, tc.errMsg)
+			})
+		}
+	})
+
+	t.Run("limits change on reload", func(t *testing.T) {
+		// The limits are reloadable: cmd/prometheus applies them to the
+		// running engine from the query_engine reloader, so a reloaded
+		// config must yield the new values without a restart.
+		before, err := LoadFile("testdata/query_cost_limits.good.yml", false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		after, err := Load("global:\n  query_max_series: 7\n  query_max_samples_read: 8\n  query_max_duration: 9s\n", promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		require.NotEqual(t, before.GlobalConfig.QueryMaxSeries, after.GlobalConfig.QueryMaxSeries)
+		require.Equal(t, uint64(7), after.GlobalConfig.QueryMaxSeries)
+		require.Equal(t, uint64(8), after.GlobalConfig.QueryMaxSamplesRead)
+		require.Equal(t, model.Duration(9*time.Second), after.GlobalConfig.QueryMaxDuration)
+	})
+}
+
 func TestRemoteWriteRetryOnRateLimit(t *testing.T) {
-	want, err := LoadFile("testdata/remote_write_retry_on_rate_limit.good.yml", false, false, log.NewNopLogger())
+	want, err := LoadFile("testdata/remote_write_retry_on_rate_limit.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 
 	out, err := yaml.Marshal(want)
-
 	require.NoError(t, err)
-	got := &Config{}
-	require.NoError(t, yaml.UnmarshalStrict(out, got))
+
+	got, err := Load(string(out), promslog.NewNopLogger())
+	require.NoError(t, err)
 
 	require.True(t, got.RemoteWriteConfigs[0].QueueConfig.RetryOnRateLimit)
 	require.False(t, got.RemoteWriteConfigs[1].QueueConfig.RetryOnRateLimit)
 }
 
+func TestRemoteWriteFailedRequestLogging(t *testing.T) {
+	cfgYAML := `
+remote_write:
+  - url: http://remote1/api/v1/write
+    failed_request_logging: true
+  - url: http://remote2/api/v1/write
+`
+	cfg, err := Load(cfgYAML, promslog.NewNopLogger())
+	require.NoError(t, err)
+	require.Len(t, cfg.RemoteWriteConfigs, 2)
+	require.True(t, cfg.RemoteWriteConfigs[0].FailedRequestLogging)
+	require.False(t, cfg.RemoteWriteConfigs[1].FailedRequestLogging)
+}
+
+func TestOTLPSanitizeResourceAttributes(t *testing.T) {
+	t.Run("good config - default resource attributes", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_default_resource_attributes.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.False(t, got.OTLPConfig.PromoteAllResourceAttributes)
+		require.Empty(t, got.OTLPConfig.IgnoreResourceAttributes)
+		require.Empty(t, got.OTLPConfig.PromoteResourceAttributes)
+	})
+
+	t.Run("good config - promote resource attributes", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_promote_resource_attributes.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.False(t, got.OTLPConfig.PromoteAllResourceAttributes)
+		require.Empty(t, got.OTLPConfig.IgnoreResourceAttributes)
+		require.Equal(t, []string{"k8s.cluster.name", "k8s.job.name", "k8s.namespace.name"}, got.OTLPConfig.PromoteResourceAttributes)
+	})
+
+	t.Run("bad config - promote resource attributes", func(t *testing.T) {
+		_, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_promote_resource_attributes.bad.yml"), false, promslog.NewNopLogger())
+		require.ErrorContains(t, err, `invalid 'promote_resource_attributes'`)
+		require.ErrorContains(t, err, `duplicated promoted OTel resource attribute "k8s.job.name"`)
+		require.ErrorContains(t, err, `empty promoted OTel resource attribute`)
+	})
+
+	t.Run("good config - promote all resource attributes", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_resource_attributes_promote_all.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+		require.True(t, got.OTLPConfig.PromoteAllResourceAttributes)
+		require.Empty(t, got.OTLPConfig.PromoteResourceAttributes)
+		require.Empty(t, got.OTLPConfig.IgnoreResourceAttributes)
+	})
+
+	t.Run("good config - ignore resource attributes", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_ignore_resource_attributes.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+		require.True(t, got.OTLPConfig.PromoteAllResourceAttributes)
+		require.Empty(t, got.OTLPConfig.PromoteResourceAttributes)
+		require.Equal(t, []string{"k8s.cluster.name", "k8s.job.name", "k8s.namespace.name"}, got.OTLPConfig.IgnoreResourceAttributes)
+	})
+
+	t.Run("bad config - ignore resource attributes", func(t *testing.T) {
+		_, err := LoadFile(filepath.Join("testdata", "otlp_sanitize_ignore_resource_attributes.bad.yml"), false, promslog.NewNopLogger())
+		require.ErrorContains(t, err, `invalid 'ignore_resource_attributes'`)
+		require.ErrorContains(t, err, `duplicated ignored OTel resource attribute "k8s.job.name"`)
+		require.ErrorContains(t, err, `empty ignored OTel resource attribute`)
+	})
+
+	t.Run("bad config - conflict between promote all and promote specific resource attributes", func(t *testing.T) {
+		_, err := LoadFile(filepath.Join("testdata", "otlp_promote_all_resource_attributes.bad.yml"), false, promslog.NewNopLogger())
+		require.ErrorContains(t, err, `'promote_all_resource_attributes' and 'promote_resource_attributes' cannot be configured simultaneously`)
+	})
+
+	t.Run("bad config - configuring ignoring of resource attributes without also enabling promotion of all resource attributes", func(t *testing.T) {
+		_, err := LoadFile(filepath.Join("testdata", "otlp_ignore_resource_attributes_without_promote_all.bad.yml"), false, promslog.NewNopLogger())
+		require.ErrorContains(t, err, `'ignore_resource_attributes' cannot be configured unless 'promote_all_resource_attributes' is true`)
+	})
+}
+
+func TestOTLPAllowServiceNameInTargetInfo(t *testing.T) {
+	t.Run("good config", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_allow_keep_identifying_resource_attributes.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.True(t, got.OTLPConfig.KeepIdentifyingResourceAttributes)
+	})
+}
+
+func TestOTLPConvertHistogramsToNHCB(t *testing.T) {
+	t.Run("good config", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_convert_histograms_to_nhcb.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.True(t, got.OTLPConfig.ConvertHistogramsToNHCB)
+	})
+}
+
+func TestOTLPPromoteScopeMetadata(t *testing.T) {
+	t.Run("good config", func(t *testing.T) {
+		want, err := LoadFile(filepath.Join("testdata", "otlp_promote_scope_metadata.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(want)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.True(t, got.OTLPConfig.PromoteScopeMetadata)
+	})
+}
+
+func TestOTLPLabelUnderscoreSanitization(t *testing.T) {
+	t.Run("defaults to true", func(t *testing.T) {
+		conf, err := LoadFile(filepath.Join("testdata", "otlp_label_underscore_sanitization_defaults.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		// Test that default values are true
+		require.True(t, conf.OTLPConfig.LabelNameUnderscoreSanitization)
+		require.True(t, conf.OTLPConfig.LabelNamePreserveMultipleUnderscores)
+	})
+
+	t.Run("explicitly enabled", func(t *testing.T) {
+		conf, err := LoadFile(filepath.Join("testdata", "otlp_label_underscore_sanitization_enabled.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		out, err := yaml.Marshal(conf)
+		require.NoError(t, err)
+		var got Config
+		require.NoError(t, yaml.UnmarshalStrict(out, &got))
+
+		require.True(t, got.OTLPConfig.LabelNameUnderscoreSanitization)
+		require.True(t, got.OTLPConfig.LabelNamePreserveMultipleUnderscores)
+	})
+
+	t.Run("explicitly disabled", func(t *testing.T) {
+		conf, err := LoadFile(filepath.Join("testdata", "otlp_label_underscore_sanitization_disabled.good.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		// When explicitly set to false, they should be false
+		require.False(t, conf.OTLPConfig.LabelNameUnderscoreSanitization)
+		require.False(t, conf.OTLPConfig.LabelNamePreserveMultipleUnderscores)
+	})
+
+	t.Run("empty config uses defaults", func(t *testing.T) {
+		conf, err := LoadFile(filepath.Join("testdata", "otlp_empty.yml"), false, promslog.NewNopLogger())
+		require.NoError(t, err)
+
+		// Empty config should use default values (true)
+		require.True(t, conf.OTLPConfig.LabelNameUnderscoreSanitization)
+		require.True(t, conf.OTLPConfig.LabelNamePreserveMultipleUnderscores)
+	})
+}
+
+func TestOTLPAllowUTF8(t *testing.T) {
+	t.Run("good config - NoUTF8EscapingWithSuffixes", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_allow_utf8.good.yml")
+		verify := func(t *testing.T, conf *Config, err error) {
+			t.Helper()
+			require.NoError(t, err)
+			require.Equal(t, otlptranslator.NoUTF8EscapingWithSuffixes, conf.OTLPConfig.TranslationStrategy)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			conf, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			conf, err := Load(string(content), promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+	})
+
+	t.Run("incompatible config - NoUTF8EscapingWithSuffixes", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_allow_utf8.incompatible.yml")
+		verify := func(t *testing.T, err error) {
+			t.Helper()
+			require.ErrorContains(t, err, `OTLP translation strategy "NoUTF8EscapingWithSuffixes" is not allowed when UTF8 is disabled`)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			_, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			_, err = Load(string(content), promslog.NewNopLogger())
+			t.Log("err", err)
+			verify(t, err)
+		})
+	})
+
+	t.Run("good config - NoTranslation", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_no_translation.good.yml")
+		verify := func(t *testing.T, conf *Config, err error) {
+			t.Helper()
+			require.NoError(t, err)
+			require.Equal(t, otlptranslator.NoTranslation, conf.OTLPConfig.TranslationStrategy)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			conf, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			conf, err := Load(string(content), promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+	})
+
+	t.Run("incompatible config - NoTranslation", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_no_translation.incompatible.yml")
+		verify := func(t *testing.T, err error) {
+			t.Helper()
+			require.ErrorContains(t, err, `OTLP translation strategy "NoTranslation" is not allowed when UTF8 is disabled`)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			_, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			_, err = Load(string(content), promslog.NewNopLogger())
+			t.Log("err", err)
+			verify(t, err)
+		})
+	})
+
+	t.Run("bad config", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_allow_utf8.bad.yml")
+		verify := func(t *testing.T, err error) {
+			t.Helper()
+			require.ErrorContains(t, err, `unsupported OTLP translation strategy "Invalid"`)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			_, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			_, err = Load(string(content), promslog.NewNopLogger())
+			verify(t, err)
+		})
+	})
+
+	t.Run("good config - missing otlp config uses default", func(t *testing.T) {
+		fpath := filepath.Join("testdata", "otlp_empty.yml")
+		verify := func(t *testing.T, conf *Config, err error) {
+			t.Helper()
+			require.NoError(t, err)
+			require.Equal(t, otlptranslator.UnderscoreEscapingWithSuffixes, conf.OTLPConfig.TranslationStrategy)
+		}
+
+		t.Run("LoadFile", func(t *testing.T) {
+			conf, err := LoadFile(fpath, false, promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+		t.Run("Load", func(t *testing.T) {
+			content, err := os.ReadFile(fpath)
+			require.NoError(t, err)
+			conf, err := Load(string(content), promslog.NewNopLogger())
+			verify(t, conf, err)
+		})
+	})
+}
+
 func TestLoadConfig(t *testing.T) {
 	// Parse a valid file that sets a global scrape timeout. This tests whether parsing
 	// an overwritten default field in the global config permanently changes the default.
-	_, err := LoadFile("testdata/global_timeout.good.yml", false, false, log.NewNopLogger())
+	_, err := LoadFile("testdata/global_timeout.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 
-	c, err := LoadFile("testdata/conf.good.yml", false, false, log.NewNopLogger())
+	c, err := LoadFile("testdata/conf.good.yml", false, promslog.NewNopLogger())
+
 	require.NoError(t, err)
-	require.Equal(t, expectedConf, c)
+	testutil.RequireEqualWithOptions(t, expectedConf, c, []cmp.Option{
+		cmpopts.IgnoreUnexported(config.ProxyConfig{}),
+		cmpopts.IgnoreUnexported(ionos.SDConfig{}),
+		cmpopts.IgnoreUnexported(outscale.SDConfig{}),
+		cmpopts.IgnoreUnexported(stackit.SDConfig{}),
+		cmpopts.IgnoreUnexported(regexp.Regexp{}),
+		cmpopts.IgnoreUnexported(hetzner.SDConfig{}),
+		cmpopts.IgnoreUnexported(Config{}),
+	})
 }
 
 func TestScrapeIntervalLarger(t *testing.T) {
-	c, err := LoadFile("testdata/scrape_interval_larger.good.yml", false, false, log.NewNopLogger())
+	c, err := LoadFile("testdata/scrape_interval_larger.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 	require.Len(t, c.ScrapeConfigs, 1)
 	for _, sc := range c.ScrapeConfigs {
@@ -1485,7 +2311,7 @@ func TestScrapeIntervalLarger(t *testing.T) {
 
 // YAML marshaling must not reveal authentication credentials.
 func TestElideSecrets(t *testing.T) {
-	c, err := LoadFile("testdata/conf.good.yml", false, false, log.NewNopLogger())
+	c, err := LoadFile("testdata/conf.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 
 	secretRe := regexp.MustCompile(`\\u003csecret\\u003e|<secret>`)
@@ -1495,38 +2321,38 @@ func TestElideSecrets(t *testing.T) {
 	yamlConfig := string(config)
 
 	matches := secretRe.FindAllStringIndex(yamlConfig, -1)
-	require.Len(t, matches, 22, "wrong number of secret matches found")
+	require.Len(t, matches, 29, "wrong number of secret matches found")
 	require.NotContains(t, yamlConfig, "mysecret",
 		"yaml marshal reveals authentication credentials.")
 }
 
 func TestLoadConfigRuleFilesAbsolutePath(t *testing.T) {
 	// Parse a valid file that sets a rule files with an absolute path
-	c, err := LoadFile(ruleFilesConfigFile, false, false, log.NewNopLogger())
+	c, err := LoadFile(ruleFilesConfigFile, false, promslog.NewNopLogger())
 	require.NoError(t, err)
 	require.Equal(t, ruleFilesExpectedConf, c)
 }
 
 func TestKubernetesEmptyAPIServer(t *testing.T) {
-	_, err := LoadFile("testdata/kubernetes_empty_apiserver.good.yml", false, false, log.NewNopLogger())
+	_, err := LoadFile("testdata/kubernetes_empty_apiserver.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 }
 
 func TestKubernetesWithKubeConfig(t *testing.T) {
-	_, err := LoadFile("testdata/kubernetes_kubeconfig_without_apiserver.good.yml", false, false, log.NewNopLogger())
+	_, err := LoadFile("testdata/kubernetes_kubeconfig_without_apiserver.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 }
 
 func TestKubernetesSelectors(t *testing.T) {
-	_, err := LoadFile("testdata/kubernetes_selectors_endpoints.good.yml", false, false, log.NewNopLogger())
+	_, err := LoadFile("testdata/kubernetes_selectors_endpoints.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
-	_, err = LoadFile("testdata/kubernetes_selectors_node.good.yml", false, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/kubernetes_selectors_node.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
-	_, err = LoadFile("testdata/kubernetes_selectors_ingress.good.yml", false, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/kubernetes_selectors_ingress.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
-	_, err = LoadFile("testdata/kubernetes_selectors_pod.good.yml", false, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/kubernetes_selectors_pod.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
-	_, err = LoadFile("testdata/kubernetes_selectors_service.good.yml", false, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/kubernetes_selectors_service.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 }
 
@@ -1548,11 +2374,7 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "labelname.bad.yml",
-		errMsg:   `"not$allowed" is not a valid label name`,
-	},
-	{
-		filename: "labelname2.bad.yml",
-		errMsg:   `"not:allowed" is not a valid label name`,
+		errMsg:   `"\xff" is not a valid label name`,
 	},
 	{
 		filename: "labelvalue.bad.yml",
@@ -1624,15 +2446,11 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "labelmap.bad.yml",
-		errMsg:   "\"l-$1\" is invalid 'replacement' for labelmap action",
+		errMsg:   "!!binary value contains invalid base64 data",
 	},
 	{
 		filename: "lowercase.bad.yml",
 		errMsg:   "relabel configuration for lowercase action requires 'target_label' value",
-	},
-	{
-		filename: "lowercase2.bad.yml",
-		errMsg:   "\"42lab\" is invalid 'target_label' for lowercase action",
 	},
 	{
 		filename: "lowercase3.bad.yml",
@@ -1641,10 +2459,6 @@ var expectedErrors = []struct {
 	{
 		filename: "uppercase.bad.yml",
 		errMsg:   "relabel configuration for uppercase action requires 'target_label' value",
-	},
-	{
-		filename: "uppercase2.bad.yml",
-		errMsg:   "\"42lab\" is invalid 'target_label' for uppercase action",
 	},
 	{
 		filename: "uppercase3.bad.yml",
@@ -1708,7 +2522,7 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "kubernetes_selectors_pod.bad.yml",
-		errMsg:   "pod role supports only pod selectors",
+		errMsg:   "pod role supports only pod, node selectors",
 	},
 	{
 		filename: "kubernetes_selectors_service.bad.yml",
@@ -1792,7 +2606,11 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "remote_write_authorization_header.bad.yml",
-		errMsg:   `authorization header must be changed via the basic_auth, authorization, oauth2, sigv4, or azuread parameter`,
+		errMsg:   `authorization header must be changed via the basic_auth, authorization, oauth2, sigv4, azuread or google_iam parameter`,
+	},
+	{
+		filename: "remote_write_wrong_msg.bad.yml",
+		errMsg:   `invalid protobuf_message value: unknown type for remote write protobuf message io.prometheus.writet.v2.Request, supported: prometheus.WriteRequest, io.prometheus.write.v2.Request`,
 	},
 	{
 		filename: "remote_write_url_missing.bad.yml",
@@ -1801,6 +2619,30 @@ var expectedErrors = []struct {
 	{
 		filename: "remote_write_dup.bad.yml",
 		errMsg:   `found multiple remote write configs with job name "queue1"`,
+	},
+	{
+		filename: "remote_write_queue_max_samples_per_send_zero.bad.yml",
+		errMsg:   `remote write queue max_samples_per_send must be positive`,
+	},
+	{
+		filename: "remote_write_queue_max_shards_zero.bad.yml",
+		errMsg:   `remote write queue max_shards must be positive`,
+	},
+	{
+		filename: "remote_write_queue_min_shards_zero.bad.yml",
+		errMsg:   `remote write queue min_shards must be positive`,
+	},
+	{
+		filename: "remote_write_queue_capacity_zero.bad.yml",
+		errMsg:   `remote write queue capacity must be positive`,
+	},
+	{
+		filename: "remote_write_queue_min_shards_greater_than_max.bad.yml",
+		errMsg:   `remote write queue min_shards must not be greater than max_shards`,
+	},
+	{
+		filename: "remote_write_queue_max_backoff_less_than_min.bad.yml",
+		errMsg:   `remote write queue max_backoff must not be less than min_backoff`,
 	},
 	{
 		filename: "remote_read_dup.bad.yml",
@@ -1840,7 +2682,11 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "azure_authentication_method.bad.yml",
-		errMsg:   "unknown authentication_type \"invalid\". Supported types are \"OAuth\", \"ManagedIdentity\" or \"SDK\"",
+		errMsg:   "unknown authentication_type \"invalid\". Supported types are \"OAuth\", \"ManagedIdentity\", \"SDK\" or \"WorkloadIdentity\"",
+	},
+	{
+		filename: "oci_authentication_method.bad.yml",
+		errMsg:   `oci_sd: unknown auth method "invalid", expected "api_key" or "instance_principal"`,
 	},
 	{
 		filename: "azure_bearertoken_basicauth.bad.yml",
@@ -1927,6 +2773,18 @@ var expectedErrors = []struct {
 		errMsg:   "at most one of secret_key & secret_key_file must be configured",
 	},
 	{
+		filename: "outscale_no_region.bad.yml",
+		errMsg:   "outscale SD configuration requires a region",
+	},
+	{
+		filename: "outscale_no_secret.bad.yml",
+		errMsg:   "one of secret_key & secret_key_file must be configured",
+	},
+	{
+		filename: "outscale_two_secrets.bad.yml",
+		errMsg:   "at most one of secret_key & secret_key_file must be configured",
+	},
+	{
 		filename: "scrape_body_size_limit.bad.yml",
 		errMsg:   "units: unknown unit  in 100",
 	},
@@ -1992,29 +2850,107 @@ var expectedErrors = []struct {
 	},
 	{
 		filename: "scrape_config_files_scrape_protocols.bad.yml",
-		errMsg:   `parsing YAML file testdata/scrape_config_files_scrape_protocols.bad.yml: scrape_protocols: unknown scrape protocol prometheusproto, supported: [OpenMetricsText0.0.1 OpenMetricsText1.0.0 PrometheusProto PrometheusText0.0.4] for scrape config with job name "node"`,
+		errMsg:   `parsing YAML file testdata/scrape_config_files_scrape_protocols.bad.yml: scrape_protocols: unknown scrape protocol prometheusproto, supported: [OpenMetricsText0.0.1 OpenMetricsText1.0.0 OpenMetricsText2.0.0 OpenMetricsText2.0.0-rc PrometheusProto PrometheusText0.0.4 PrometheusText1.0.0] for scrape config with job name "node"`,
 	},
 	{
 		filename: "scrape_config_files_scrape_protocols2.bad.yml",
 		errMsg:   `parsing YAML file testdata/scrape_config_files_scrape_protocols2.bad.yml: duplicated protocol in scrape_protocols, got [OpenMetricsText1.0.0 PrometheusProto OpenMetricsText1.0.0] for scrape config with job name "node"`,
 	},
+	{
+		filename: "scrape_config_files_fallback_scrape_protocol1.bad.yml",
+		errMsg:   `parsing YAML file testdata/scrape_config_files_fallback_scrape_protocol1.bad.yml: invalid fallback_scrape_protocol for scrape config with job name "node": unknown scrape protocol prometheusproto, supported: [OpenMetricsText0.0.1 OpenMetricsText1.0.0 OpenMetricsText2.0.0 OpenMetricsText2.0.0-rc PrometheusProto PrometheusText0.0.4 PrometheusText1.0.0]`,
+	},
+	{
+		filename: "scrape_config_files_fallback_scrape_protocol2.bad.yml",
+		errMsg:   `unmarshal errors`,
+	},
+	{
+		filename: "scrape_config_utf8_conflicting.bad.yml",
+		errMsg:   `utf8 metric names requested but validation scheme is not set to UTF8`,
+	},
+	{
+		filename: "stackit_endpoint.bad.yml",
+		errMsg:   "invalid endpoint",
+	},
+	{
+		filename: "tsdb_retention_time.bad.yml",
+		errMsg:   `not a valid duration string: "-1h"`,
+	},
+	{
+		filename: "tsdb_retention_size.bad.yml",
+		errMsg:   `'storage.tsdb.retention.size' must be greater than or equal to 0`,
+	},
+	{
+		filename: "tsdb_retention_percentage.bad.yml",
+		errMsg:   `'storage.tsdb.retention.percentage' must be in the range [0, 100]`,
+	},
+	{
+		filename: "tsdb_retention_percentage_negative.bad.yml",
+		errMsg:   "'storage.tsdb.retention.percentage' must be in the range [0, 100]",
+	},
+	{
+		filename: "tsdb_chunk_encoding_floats.bad.yml",
+		errMsg:   `'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got "xor3"`,
+	},
+	{
+		filename: "tsdb_chunk_encoding_floats_wrong_case.bad.yml",
+		errMsg:   `'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got "XOR"`,
+	},
+	{
+		filename: "tsdb_chunk_encoding_floats_wrong_case_xor2.bad.yml",
+		errMsg:   `'storage.tsdb.chunk_encoding.floats' must be 'xor' or 'xor2', or the field must be omitted entirely, got "XOR2"`,
+	},
+	{
+		filename: "metric_name_validation_scheme.bad.yml",
+		errMsg:   "unrecognized ValidationScheme: \"invalid_scheme\"",
+	},
+	{
+		filename: "query_max_series.bad.yml",
+		errMsg:   "cannot unmarshal !!int `-1` into uint64",
+	},
+	{
+		filename: "query_max_samples_read.bad.yml",
+		errMsg:   "cannot unmarshal !!str `many` into uint64",
+	},
+	{
+		filename: "query_max_duration.bad.yml",
+		errMsg:   `not a valid duration string: "-1s"`,
+	},
 }
 
 func TestBadConfigs(t *testing.T) {
 	for _, ee := range expectedErrors {
-		_, err := LoadFile("testdata/"+ee.filename, false, false, log.NewNopLogger())
-		require.Error(t, err, "%s", ee.filename)
-		require.Contains(t, err.Error(), ee.errMsg,
+		_, err := LoadFile("testdata/"+ee.filename, false, promslog.NewNopLogger())
+		require.ErrorContains(t, err, ee.errMsg,
 			"Expected error for %s to contain %q but got: %s", ee.filename, ee.errMsg, err)
 	}
 }
 
-func TestBadStaticConfigsJSON(t *testing.T) {
-	content, err := os.ReadFile("testdata/static_config.bad.json")
+func TestTSDBRetentionPercentageFloat(t *testing.T) {
+	c, err := LoadFile("testdata/tsdb_retention_percentage_float.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
-	var tg targetgroup.Group
-	err = json.Unmarshal(content, &tg)
-	require.Error(t, err)
+	require.Equal(t, 0.5, c.StorageConfig.TSDBConfig.Retention.Percentage)
+}
+
+func TestTSDBChunkEncoding(t *testing.T) {
+	for _, tc := range []struct {
+		filename string
+		encoding string
+	}{
+		{filename: "tsdb_chunk_encoding_floats_xor.good.yml", encoding: FloatChunkEncodingXOR},
+		{filename: "tsdb_chunk_encoding_floats_xor2.good.yml", encoding: FloatChunkEncodingXOR2},
+	} {
+		t.Run(tc.encoding, func(t *testing.T) {
+			c, err := LoadFile("testdata/"+tc.filename, false, promslog.NewNopLogger())
+			require.NoError(t, err)
+			require.Equal(t, tc.encoding, c.StorageConfig.TSDBConfig.ChunkEncoding.Floats)
+		})
+	}
+
+	// Empty/absent value is also valid.
+	c, err := Load("", promslog.NewNopLogger())
+	require.NoError(t, err)
+	require.Empty(t, c.StorageConfig.TSDBConfig.ChunkEncoding.Floats)
 }
 
 func TestBadStaticConfigsYML(t *testing.T) {
@@ -2026,48 +2962,109 @@ func TestBadStaticConfigsYML(t *testing.T) {
 }
 
 func TestEmptyConfig(t *testing.T) {
-	c, err := Load("", false, log.NewNopLogger())
+	c, err := Load("", promslog.NewNopLogger())
 	require.NoError(t, err)
 	exp := DefaultConfig
+	exp.loaded = true
+	retention := DefaultTSDBRetentionConfig
+	exp.StorageConfig.TSDBConfig = &TSDBConfig{Retention: &retention}
 	require.Equal(t, exp, *c)
+	require.Equal(t, 75, c.Runtime.GoGC)
+	require.Equal(t, LogLevel("info"), c.Runtime.LogLevel)
+}
+
+func TestRuntimeLogLevelConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		config    string
+		expected  LogLevel
+		errString string
+	}{
+		{
+			name:     "default",
+			expected: LogLevel("info"),
+		},
+		{
+			name: "configured",
+			config: `runtime:
+  log_level: warn
+`,
+			expected: LogLevel("warn"),
+		},
+		{
+			name: "normalized",
+			config: `runtime:
+  log_level: DEBUG
+`,
+			expected: LogLevel("debug"),
+		},
+		{
+			name: "invalid",
+			config: `runtime:
+  log_level: verbose
+`,
+			errString: "unrecognized log level verbose",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(tc.config, promslog.NewNopLogger())
+			if tc.errString != "" {
+				require.ErrorContains(t, err, tc.errString)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, tc.expected, cfg.Runtime.LogLevel)
+		})
+	}
+
+	t.Run("configured process default", func(t *testing.T) {
+		previousRuntimeDefault := DefaultRuntimeConfig
+		previousConfigRuntime := DefaultConfig.Runtime
+		t.Cleanup(func() {
+			DefaultRuntimeConfig = previousRuntimeDefault
+			DefaultConfig.Runtime = previousConfigRuntime
+		})
+
+		DefaultRuntimeConfig.LogLevel = LogLevel("debug")
+		DefaultConfig.Runtime = DefaultRuntimeConfig
+		cfg, err := Load("runtime:\n  gogc: 77\n", promslog.NewNopLogger())
+		require.NoError(t, err)
+		require.Equal(t, LogLevel("debug"), cfg.Runtime.LogLevel)
+	})
 }
 
 func TestExpandExternalLabels(t *testing.T) {
 	// Cleanup ant TEST env variable that could exist on the system.
 	os.Setenv("TEST", "")
 
-	c, err := LoadFile("testdata/external_labels.good.yml", false, false, log.NewNopLogger())
-	require.NoError(t, err)
-	testutil.RequireEqual(t, labels.FromStrings("bar", "foo", "baz", "foo${TEST}bar", "foo", "${TEST}", "qux", "foo$${TEST}", "xyz", "foo$$bar"), c.GlobalConfig.ExternalLabels)
-
-	c, err = LoadFile("testdata/external_labels.good.yml", false, true, log.NewNopLogger())
+	c, err := LoadFile("testdata/external_labels.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 	testutil.RequireEqual(t, labels.FromStrings("bar", "foo", "baz", "foobar", "foo", "", "qux", "foo${TEST}", "xyz", "foo$bar"), c.GlobalConfig.ExternalLabels)
 
 	os.Setenv("TEST", "TestValue")
-	c, err = LoadFile("testdata/external_labels.good.yml", false, true, log.NewNopLogger())
+	c, err = LoadFile("testdata/external_labels.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 	testutil.RequireEqual(t, labels.FromStrings("bar", "foo", "baz", "fooTestValuebar", "foo", "TestValue", "qux", "foo${TEST}", "xyz", "foo$bar"), c.GlobalConfig.ExternalLabels)
 }
 
 func TestAgentMode(t *testing.T) {
-	_, err := LoadFile("testdata/agent_mode.with_alert_manager.yml", true, false, log.NewNopLogger())
+	_, err := LoadFile("testdata/agent_mode.with_alert_manager.yml", true, promslog.NewNopLogger())
 	require.ErrorContains(t, err, "field alerting is not allowed in agent mode")
 
-	_, err = LoadFile("testdata/agent_mode.with_alert_relabels.yml", true, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/agent_mode.with_alert_relabels.yml", true, promslog.NewNopLogger())
 	require.ErrorContains(t, err, "field alerting is not allowed in agent mode")
 
-	_, err = LoadFile("testdata/agent_mode.with_rule_files.yml", true, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/agent_mode.with_rule_files.yml", true, promslog.NewNopLogger())
 	require.ErrorContains(t, err, "field rule_files is not allowed in agent mode")
 
-	_, err = LoadFile("testdata/agent_mode.with_remote_reads.yml", true, false, log.NewNopLogger())
+	_, err = LoadFile("testdata/agent_mode.with_remote_reads.yml", true, promslog.NewNopLogger())
 	require.ErrorContains(t, err, "field remote_read is not allowed in agent mode")
 
-	c, err := LoadFile("testdata/agent_mode.without_remote_writes.yml", true, false, log.NewNopLogger())
+	c, err := LoadFile("testdata/agent_mode.without_remote_writes.yml", true, promslog.NewNopLogger())
 	require.NoError(t, err)
 	require.Empty(t, c.RemoteWriteConfigs)
 
-	c, err = LoadFile("testdata/agent_mode.good.yml", true, false, log.NewNopLogger())
+	c, err = LoadFile("testdata/agent_mode.good.yml", true, promslog.NewNopLogger())
 	require.NoError(t, err)
 	require.Len(t, c.RemoteWriteConfigs, 1)
 	require.Equal(
@@ -2077,21 +3074,116 @@ func TestAgentMode(t *testing.T) {
 	)
 }
 
-func TestEmptyGlobalBlock(t *testing.T) {
-	c, err := Load("global:\n", false, log.NewNopLogger())
-	require.NoError(t, err)
-	exp := DefaultConfig
-	require.Equal(t, exp, *c)
+func TestGlobalConfig(t *testing.T) {
+	t.Run("empty block restores defaults", func(t *testing.T) {
+		c, err := Load("global:\n", promslog.NewNopLogger())
+		require.NoError(t, err)
+		exp := DefaultConfig
+		exp.loaded = true
+		// TSDBConfig is always injected by Config.UnmarshalYAML even when no
+		// storage.tsdb section is present, so the expected config must include it.
+		retention := DefaultTSDBRetentionConfig
+		exp.StorageConfig.TSDBConfig = &TSDBConfig{Retention: &retention}
+		require.Equal(t, exp, *c)
+	})
+
+	// Verify that isZero() correctly identifies non-zero configurations for all
+	// fields in GlobalConfig. This is important because isZero() is used during
+	// YAML unmarshaling to detect empty global blocks that should be replaced
+	// with defaults.
+	t.Run("isZero", func(t *testing.T) {
+		for _, tc := range []struct {
+			name       string
+			config     GlobalConfig
+			expectZero bool
+		}{
+			{
+				name:       "empty GlobalConfig",
+				config:     GlobalConfig{},
+				expectZero: true,
+			},
+			{
+				name:       "ScrapeInterval set",
+				config:     GlobalConfig{ScrapeInterval: model.Duration(30 * time.Second)},
+				expectZero: false,
+			},
+			{
+				name:       "BodySizeLimit set",
+				config:     GlobalConfig{BodySizeLimit: 1 * units.MiB},
+				expectZero: false,
+			},
+			{
+				name:       "SampleLimit set",
+				config:     GlobalConfig{SampleLimit: 1000},
+				expectZero: false,
+			},
+			{
+				name:       "TargetLimit set",
+				config:     GlobalConfig{TargetLimit: 500},
+				expectZero: false,
+			},
+			{
+				name:       "LabelLimit set",
+				config:     GlobalConfig{LabelLimit: 100},
+				expectZero: false,
+			},
+			{
+				name:       "LabelNameLengthLimit set",
+				config:     GlobalConfig{LabelNameLengthLimit: 50},
+				expectZero: false,
+			},
+			{
+				name:       "LabelValueLengthLimit set",
+				config:     GlobalConfig{LabelValueLengthLimit: 200},
+				expectZero: false,
+			},
+			{
+				name:       "KeepDroppedTargets set",
+				config:     GlobalConfig{KeepDroppedTargets: 10},
+				expectZero: false,
+			},
+			{
+				name:       "MetricNameValidationScheme set",
+				config:     GlobalConfig{MetricNameValidationScheme: model.LegacyValidation},
+				expectZero: false,
+			},
+			{
+				name:       "MetricNameEscapingScheme set",
+				config:     GlobalConfig{MetricNameEscapingScheme: model.EscapeUnderscores},
+				expectZero: false,
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				result := tc.config.isZero()
+				require.Equal(t, tc.expectZero, result)
+			})
+		}
+	})
+}
+
+// ScrapeConfigOptions contains options for creating a scrape config.
+type ScrapeConfigOptions struct {
+	JobName                       string
+	ScrapeInterval                model.Duration
+	ScrapeTimeout                 model.Duration
+	ScrapeProtocols               []ScrapeProtocol // Set to DefaultScrapeProtocols by default.
+	ScrapeNativeHistograms        bool
+	AlwaysScrapeClassicHistograms bool
+	ConvertClassicHistToNHCB      bool
+	ExtraScrapeMetrics            bool
 }
 
 func TestGetScrapeConfigs(t *testing.T) {
-	sc := func(jobName string, scrapeInterval, scrapeTimeout model.Duration) *ScrapeConfig {
-		return &ScrapeConfig{
-			JobName:         jobName,
-			HonorTimestamps: true,
-			ScrapeInterval:  scrapeInterval,
-			ScrapeTimeout:   scrapeTimeout,
-			ScrapeProtocols: DefaultGlobalConfig.ScrapeProtocols,
+	// Helper function to create a scrape config with the given options.
+	sc := func(opts ScrapeConfigOptions) *ScrapeConfig {
+		sc := ScrapeConfig{
+			JobName:                    opts.JobName,
+			HonorTimestamps:            true,
+			ScrapeInterval:             opts.ScrapeInterval,
+			ScrapeTimeout:              opts.ScrapeTimeout,
+			ScrapeProtocols:            opts.ScrapeProtocols,
+			MetricNameValidationScheme: model.UTF8Validation,
+			MetricNameEscapingScheme:   model.AllowUTF8,
 
 			MetricsPath:       "/metrics",
 			Scheme:            "http",
@@ -2109,7 +3201,15 @@ func TestGetScrapeConfigs(t *testing.T) {
 					},
 				},
 			},
+			ScrapeNativeHistograms:         boolPtr(opts.ScrapeNativeHistograms),
+			AlwaysScrapeClassicHistograms:  boolPtr(opts.AlwaysScrapeClassicHistograms),
+			ConvertClassicHistogramsToNHCB: boolPtr(opts.ConvertClassicHistToNHCB),
+			ExtraScrapeMetrics:             boolPtr(opts.ExtraScrapeMetrics),
 		}
+		if opts.ScrapeProtocols == nil {
+			sc.ScrapeProtocols = DefaultScrapeProtocols
+		}
+		return &sc
 	}
 
 	testCases := []struct {
@@ -2119,35 +3219,76 @@ func TestGetScrapeConfigs(t *testing.T) {
 		expectedError  string
 	}{
 		{
-			name:           "An included config file should be a valid global config.",
-			configFile:     "testdata/scrape_config_files.good.yml",
-			expectedResult: []*ScrapeConfig{sc("prometheus", model.Duration(60*time.Second), model.Duration(10*time.Second))},
+			name:       "An included config file should be a valid global config.",
+			configFile: "testdata/scrape_config_files.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{
+				JobName:                       "prometheus",
+				ScrapeInterval:                model.Duration(60 * time.Second),
+				ScrapeTimeout:                 model.Duration(10 * time.Second),
+				ScrapeNativeHistograms:        false,
+				AlwaysScrapeClassicHistograms: false,
+				ConvertClassicHistToNHCB:      false,
+			})},
 		},
 		{
-			name:           "An global config that only include a scrape config file.",
-			configFile:     "testdata/scrape_config_files_only.good.yml",
-			expectedResult: []*ScrapeConfig{sc("prometheus", model.Duration(60*time.Second), model.Duration(10*time.Second))},
+			name:       "A global config that only include a scrape config file.",
+			configFile: "testdata/scrape_config_files_only.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{
+				JobName:                       "prometheus",
+				ScrapeInterval:                model.Duration(60 * time.Second),
+				ScrapeTimeout:                 model.Duration(10 * time.Second),
+				ScrapeNativeHistograms:        false,
+				AlwaysScrapeClassicHistograms: false,
+				ConvertClassicHistToNHCB:      false,
+			})},
 		},
 		{
-			name:       "An global config that combine scrape config files and scrape configs.",
+			name:       "A global config that combine scrape config files and scrape configs.",
 			configFile: "testdata/scrape_config_files_combined.good.yml",
 			expectedResult: []*ScrapeConfig{
-				sc("node", model.Duration(60*time.Second), model.Duration(10*time.Second)),
-				sc("prometheus", model.Duration(60*time.Second), model.Duration(10*time.Second)),
-				sc("alertmanager", model.Duration(60*time.Second), model.Duration(10*time.Second)),
+				sc(ScrapeConfigOptions{
+					JobName:                       "node",
+					ScrapeInterval:                model.Duration(60 * time.Second),
+					ScrapeTimeout:                 model.Duration(10 * time.Second),
+					ScrapeNativeHistograms:        false,
+					AlwaysScrapeClassicHistograms: false,
+					ConvertClassicHistToNHCB:      false,
+				}),
+				sc(ScrapeConfigOptions{
+					JobName:                       "prometheus",
+					ScrapeInterval:                model.Duration(60 * time.Second),
+					ScrapeTimeout:                 model.Duration(10 * time.Second),
+					ScrapeNativeHistograms:        false,
+					AlwaysScrapeClassicHistograms: false,
+					ConvertClassicHistToNHCB:      false,
+				}),
+				sc(ScrapeConfigOptions{
+					JobName:                       "alertmanager",
+					ScrapeInterval:                model.Duration(60 * time.Second),
+					ScrapeTimeout:                 model.Duration(10 * time.Second),
+					ScrapeNativeHistograms:        false,
+					AlwaysScrapeClassicHistograms: false,
+					ConvertClassicHistToNHCB:      false,
+				}),
 			},
 		},
 		{
-			name:       "An global config that includes a scrape config file with globs",
+			name:       "A global config that includes a scrape config file with globs",
 			configFile: "testdata/scrape_config_files_glob.good.yml",
 			expectedResult: []*ScrapeConfig{
 				{
 					JobName: "prometheus",
 
-					HonorTimestamps: true,
-					ScrapeInterval:  model.Duration(60 * time.Second),
-					ScrapeTimeout:   DefaultGlobalConfig.ScrapeTimeout,
-					ScrapeProtocols: DefaultGlobalConfig.ScrapeProtocols,
+					HonorTimestamps:                true,
+					ScrapeInterval:                 model.Duration(60 * time.Second),
+					ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+					ScrapeProtocols:                DefaultScrapeProtocols,
+					MetricNameValidationScheme:     model.UTF8Validation,
+					MetricNameEscapingScheme:       model.AllowUTF8,
+					ScrapeNativeHistograms:         boolPtr(false),
+					AlwaysScrapeClassicHistograms:  boolPtr(false),
+					ConvertClassicHistogramsToNHCB: boolPtr(false),
+					ExtraScrapeMetrics:             boolPtr(false),
 
 					MetricsPath: DefaultScrapeConfig.MetricsPath,
 					Scheme:      DefaultScrapeConfig.Scheme,
@@ -2177,10 +3318,16 @@ func TestGetScrapeConfigs(t *testing.T) {
 				{
 					JobName: "node",
 
-					HonorTimestamps: true,
-					ScrapeInterval:  model.Duration(15 * time.Second),
-					ScrapeTimeout:   DefaultGlobalConfig.ScrapeTimeout,
-					ScrapeProtocols: DefaultGlobalConfig.ScrapeProtocols,
+					HonorTimestamps:                true,
+					ScrapeInterval:                 model.Duration(15 * time.Second),
+					ScrapeTimeout:                  DefaultGlobalConfig.ScrapeTimeout,
+					ScrapeProtocols:                DefaultScrapeProtocols,
+					MetricNameValidationScheme:     model.UTF8Validation,
+					MetricNameEscapingScheme:       model.AllowUTF8,
+					ScrapeNativeHistograms:         boolPtr(false),
+					AlwaysScrapeClassicHistograms:  boolPtr(false),
+					ConvertClassicHistogramsToNHCB: boolPtr(false),
+					ExtraScrapeMetrics:             boolPtr(false),
 
 					HTTPClientConfig: config.HTTPClientConfig{
 						TLSConfig: config.TLSConfig{
@@ -2214,32 +3361,210 @@ func TestGetScrapeConfigs(t *testing.T) {
 			},
 		},
 		{
-			name:          "An global config that includes twice the same scrape configs.",
+			name:          "A global config that includes twice the same scrape configs.",
 			configFile:    "testdata/scrape_config_files_double_import.bad.yml",
 			expectedError: `found multiple scrape configs with job name "prometheus"`,
 		},
 		{
-			name:          "An global config that includes a scrape config identical to a scrape config in the main file.",
+			name:          "A global config that includes a scrape config identical to a scrape config in the main file.",
 			configFile:    "testdata/scrape_config_files_duplicate.bad.yml",
 			expectedError: `found multiple scrape configs with job name "prometheus"`,
 		},
 		{
-			name:          "An global config that includes a scrape config file with errors.",
+			name:          "A global config that includes a scrape config file with errors.",
 			configFile:    "testdata/scrape_config_files_global.bad.yml",
 			expectedError: `scrape timeout greater than scrape interval for scrape config with job name "prometheus"`,
+		},
+		{
+			name:           "A global config that enables convert classic histograms to nhcb.",
+			configFile:     "testdata/global_convert_classic_hist_to_nhcb.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: false, ConvertClassicHistToNHCB: true})},
+		},
+		{
+			name:           "A global config that enables convert classic histograms to nhcb and scrape config that disables the conversion",
+			configFile:     "testdata/local_disable_convert_classic_hist_to_nhcb.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: false, ConvertClassicHistToNHCB: false})},
+		},
+		{
+			name:           "A global config that disables convert classic histograms to nhcb and scrape config that enables the conversion",
+			configFile:     "testdata/local_convert_classic_hist_to_nhcb.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: false, ConvertClassicHistToNHCB: true})},
+		},
+		{
+			name:           "A global config that enables always scrape classic histograms",
+			configFile:     "testdata/global_enable_always_scrape_classic_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: true, ConvertClassicHistToNHCB: false})},
+		},
+		{
+			name:           "A global config that disables always scrape classic histograms",
+			configFile:     "testdata/global_disable_always_scrape_classic_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: false, ConvertClassicHistToNHCB: false})},
+		},
+		{
+			name:           "A global config that disables always scrape classic histograms and scrape config that enables it",
+			configFile:     "testdata/local_enable_always_scrape_classic_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: true, ConvertClassicHistToNHCB: false})},
+		},
+		{
+			name:           "A global config that enables always scrape classic histograms and scrape config that disables it",
+			configFile:     "testdata/local_disable_always_scrape_classic_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), AlwaysScrapeClassicHistograms: false, ConvertClassicHistToNHCB: false})},
+		},
+		{
+			name:           "A global config that enables scrape native histograms",
+			configFile:     "testdata/global_enable_scrape_native_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: true, ScrapeProtocols: DefaultProtoFirstScrapeProtocols})},
+		},
+		{
+			name:           "A global config that enables scrape native histograms and sets scrape protocols explicitly",
+			configFile:     "testdata/global_enable_scrape_native_hist_and_scrape_protocols.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: true, ScrapeProtocols: []ScrapeProtocol{PrometheusText0_0_4}})},
+		},
+		{
+			name:           "A local config that enables scrape native histograms",
+			configFile:     "testdata/local_enable_scrape_native_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: true, ScrapeProtocols: DefaultProtoFirstScrapeProtocols})},
+		},
+		{
+			name:           "A local config that enables scrape native histograms and sets scrape protocols explicitly",
+			configFile:     "testdata/local_enable_scrape_native_hist_and_scrape_protocols.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: true, ScrapeProtocols: []ScrapeProtocol{PrometheusText0_0_4}})},
+		},
+		{
+			name:           "A global config that enables scrape native histograms and scrape config that disables it",
+			configFile:     "testdata/local_disable_scrape_native_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: false, ScrapeProtocols: DefaultScrapeProtocols})},
+		},
+		{
+			name:           "A global config that enables scrape native histograms and scrape protocols and scrape config that disables scrape native histograms but does not change scrape protocols",
+			configFile:     "testdata/global_scrape_protocols_and_local_disable_scrape_native_hist.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ScrapeNativeHistograms: false, ScrapeProtocols: []ScrapeProtocol{PrometheusText0_0_4}})},
+		},
+		{
+			name:           "A global config that enables extra scrape metrics",
+			configFile:     "testdata/global_enable_extra_scrape_metrics.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ExtraScrapeMetrics: true})},
+		},
+		{
+			name:           "A global config that disables extra scrape metrics",
+			configFile:     "testdata/global_disable_extra_scrape_metrics.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ExtraScrapeMetrics: false})},
+		},
+		{
+			name:           "A global config that disables extra scrape metrics and scrape config that enables it",
+			configFile:     "testdata/local_enable_extra_scrape_metrics.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ExtraScrapeMetrics: true})},
+		},
+		{
+			name:           "A global config that enables extra scrape metrics and scrape config that disables it",
+			configFile:     "testdata/local_disable_extra_scrape_metrics.good.yml",
+			expectedResult: []*ScrapeConfig{sc(ScrapeConfigOptions{JobName: "prometheus", ScrapeInterval: model.Duration(60 * time.Second), ScrapeTimeout: model.Duration(10 * time.Second), ExtraScrapeMetrics: false})},
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := LoadFile(tc.configFile, false, false, log.NewNopLogger())
+			c, err := LoadFile(tc.configFile, false, promslog.NewNopLogger())
 			require.NoError(t, err)
 
 			scfgs, err := c.GetScrapeConfigs()
-			if len(tc.expectedError) > 0 {
+			if tc.expectedError != "" {
 				require.ErrorContains(t, err, tc.expectedError)
 			}
 			require.Equal(t, tc.expectedResult, scfgs)
+		})
+	}
+}
+
+func TestExtraScrapeMetrics(t *testing.T) {
+	tests := []struct {
+		name          string
+		config        string
+		expectGlobal  *bool
+		expectEnabled bool
+	}{
+		{
+			name: "default values (not set)",
+			config: `
+scrape_configs:
+  - job_name: test
+    static_configs:
+      - targets: ['localhost:9090']
+`,
+			expectGlobal:  boolPtr(false), // inherits from DefaultGlobalConfig
+			expectEnabled: false,
+		},
+		{
+			name: "global enabled",
+			config: `
+global:
+  extra_scrape_metrics: true
+scrape_configs:
+  - job_name: test
+    static_configs:
+      - targets: ['localhost:9090']
+`,
+			expectGlobal:  boolPtr(true),
+			expectEnabled: true,
+		},
+		{
+			name: "global disabled",
+			config: `
+global:
+  extra_scrape_metrics: false
+scrape_configs:
+  - job_name: test
+    static_configs:
+      - targets: ['localhost:9090']
+`,
+			expectGlobal:  boolPtr(false),
+			expectEnabled: false,
+		},
+		{
+			name: "scrape override enabled",
+			config: `
+global:
+  extra_scrape_metrics: false
+scrape_configs:
+  - job_name: test
+    extra_scrape_metrics: true
+    static_configs:
+      - targets: ['localhost:9090']
+`,
+			expectGlobal:  boolPtr(false),
+			expectEnabled: true,
+		},
+		{
+			name: "scrape override disabled",
+			config: `
+global:
+  extra_scrape_metrics: true
+scrape_configs:
+  - job_name: test
+    extra_scrape_metrics: false
+    static_configs:
+      - targets: ['localhost:9090']
+`,
+			expectGlobal:  boolPtr(true),
+			expectEnabled: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(tc.config, promslog.NewNopLogger())
+			require.NoError(t, err)
+
+			// Check global config
+			require.Equal(t, tc.expectGlobal, cfg.GlobalConfig.ExtraScrapeMetrics)
+
+			// Check scrape config
+			scfgs, err := cfg.GetScrapeConfigs()
+			require.NoError(t, err)
+			require.Len(t, scfgs, 1)
+
+			// Check the effective value via the helper method
+			require.Equal(t, tc.expectEnabled, scfgs[0].ExtraScrapeMetricsEnabled())
 		})
 	}
 }
@@ -2250,7 +3575,7 @@ func kubernetesSDHostURL() config.URL {
 }
 
 func TestScrapeConfigDisableCompression(t *testing.T) {
-	want, err := LoadFile("testdata/scrape_config_disable_compression.good.yml", false, false, log.NewNopLogger())
+	want, err := LoadFile("testdata/scrape_config_disable_compression.good.yml", false, promslog.NewNopLogger())
 	require.NoError(t, err)
 
 	out, err := yaml.Marshal(want)
@@ -2260,4 +3585,359 @@ func TestScrapeConfigDisableCompression(t *testing.T) {
 	require.NoError(t, yaml.UnmarshalStrict(out, got))
 
 	require.False(t, got.ScrapeConfigs[0].EnableCompression)
+}
+
+func TestScrapeConfigNameValidationSettings(t *testing.T) {
+	tests := []struct {
+		name           string
+		inputFile      string
+		expectScheme   model.ValidationScheme
+		expectEscaping model.EscapingScheme
+	}{
+		{
+			name:           "blank config implies default",
+			inputFile:      "scrape_config_default_validation_mode",
+			expectScheme:   model.UTF8Validation,
+			expectEscaping: model.NoEscaping,
+		},
+		{
+			name:           "global setting implies local settings",
+			inputFile:      "scrape_config_global_validation_mode",
+			expectScheme:   model.LegacyValidation,
+			expectEscaping: model.DotsEscaping,
+		},
+		{
+			name:           "local setting",
+			inputFile:      "scrape_config_local_validation_mode",
+			expectScheme:   model.LegacyValidation,
+			expectEscaping: model.ValueEncodingEscaping,
+		},
+		{
+			name:           "local setting overrides global setting",
+			inputFile:      "scrape_config_local_global_validation_mode",
+			expectScheme:   model.UTF8Validation,
+			expectEscaping: model.DotsEscaping,
+		},
+		{
+			name:           "local validation implies underscores escaping",
+			inputFile:      "scrape_config_local_infer_escaping",
+			expectScheme:   model.LegacyValidation,
+			expectEscaping: model.UnderscoreEscaping,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := LoadFile(fmt.Sprintf("testdata/%s.yml", tc.inputFile), false, promslog.NewNopLogger())
+			require.NoError(t, err)
+
+			out, err := yaml.Marshal(want)
+
+			require.NoError(t, err)
+			got := &Config{}
+			require.NoError(t, yaml.UnmarshalStrict(out, got))
+
+			require.Equal(t, tc.expectScheme, got.ScrapeConfigs[0].MetricNameValidationScheme)
+
+			escaping, err := model.ToEscapingScheme(got.ScrapeConfigs[0].MetricNameEscapingScheme)
+			require.NoError(t, err)
+			require.Equal(t, tc.expectEscaping, escaping)
+		})
+	}
+}
+
+func TestScrapeConfigNameEscapingSettings(t *testing.T) {
+	tests := []struct {
+		name                   string
+		inputFile              string
+		expectValidationScheme model.ValidationScheme
+		expectEscapingScheme   string
+	}{
+		{
+			name:                   "blank config implies default",
+			inputFile:              "scrape_config_default_validation_mode",
+			expectValidationScheme: model.UTF8Validation,
+			expectEscapingScheme:   "allow-utf-8",
+		},
+		{
+			name:                   "global setting implies local settings",
+			inputFile:              "scrape_config_global_validation_mode",
+			expectValidationScheme: model.LegacyValidation,
+			expectEscapingScheme:   "dots",
+		},
+		{
+			name:                   "local setting",
+			inputFile:              "scrape_config_local_validation_mode",
+			expectValidationScheme: model.LegacyValidation,
+			expectEscapingScheme:   "values",
+		},
+		{
+			name:                   "local setting overrides global setting",
+			inputFile:              "scrape_config_local_global_validation_mode",
+			expectValidationScheme: model.UTF8Validation,
+			expectEscapingScheme:   "dots",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			want, err := LoadFile(fmt.Sprintf("testdata/%s.yml", tc.inputFile), false, promslog.NewNopLogger())
+			require.NoError(t, err)
+
+			out, err := yaml.Marshal(want)
+
+			require.NoError(t, err)
+			got := &Config{}
+			require.NoError(t, yaml.UnmarshalStrict(out, got))
+
+			require.Equal(t, tc.expectValidationScheme, got.ScrapeConfigs[0].MetricNameValidationScheme)
+			require.Equal(t, tc.expectEscapingScheme, got.ScrapeConfigs[0].MetricNameEscapingScheme)
+		})
+	}
+}
+
+func TestScrapeProtocolHeader(t *testing.T) {
+	tests := []struct {
+		name          string
+		proto         ScrapeProtocol
+		expectedValue string
+	}{
+		{
+			name:          "blank",
+			proto:         ScrapeProtocol(""),
+			expectedValue: "",
+		},
+		{
+			name:          "invalid",
+			proto:         ScrapeProtocol("invalid"),
+			expectedValue: "",
+		},
+		{
+			name:          "prometheus protobuf",
+			proto:         PrometheusProto,
+			expectedValue: "application/vnd.google.protobuf",
+		},
+		{
+			name:          "prometheus text 0.0.4",
+			proto:         PrometheusText0_0_4,
+			expectedValue: "text/plain",
+		},
+		{
+			name:          "prometheus text 1.0.0",
+			proto:         PrometheusText1_0_0,
+			expectedValue: "text/plain",
+		},
+		{
+			name:          "openmetrics 0.0.1",
+			proto:         OpenMetricsText0_0_1,
+			expectedValue: "application/openmetrics-text",
+		},
+		{
+			name:          "openmetrics 1.0.0",
+			proto:         OpenMetricsText1_0_0,
+			expectedValue: "application/openmetrics-text",
+		},
+		{
+			name:          "openmetrics 2.0.0-rc",
+			proto:         OpenMetricsText2_0_0_rc,
+			expectedValue: "application/openmetrics-text",
+		},
+		{
+			name:          "openmetrics 2.0.0",
+			proto:         OpenMetricsText2_0_0,
+			expectedValue: "application/openmetrics-text",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mediaType := tc.proto.HeaderMediaType()
+
+			require.Equal(t, tc.expectedValue, mediaType)
+		})
+	}
+}
+
+// Regression test against https://github.com/prometheus/prometheus/issues/15538
+func TestGetScrapeConfigs_Loaded(t *testing.T) {
+	t.Run("without load", func(t *testing.T) {
+		c := &Config{}
+		_, err := c.GetScrapeConfigs()
+		require.EqualError(t, err, "scrape config cannot be fetched, main config was not validated and loaded correctly; should not happen")
+	})
+	t.Run("with load", func(t *testing.T) {
+		c, err := Load("", promslog.NewNopLogger())
+		require.NoError(t, err)
+		_, err = c.GetScrapeConfigs()
+		require.NoError(t, err)
+	})
+}
+
+func TestRemoteWriteConfig_Mode(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		config                     string
+		expectMode                 remoteapi.WriteMode
+		expectSendNativeHistograms bool
+		errString                  string
+	}{
+		{
+			name: "default mode (none)",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+`,
+			expectMode:                 remoteapi.WriteModeNone,
+			expectSendNativeHistograms: false,
+		},
+		{
+			name: "explicit none mode with v2",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: none
+`,
+			expectMode:                 remoteapi.WriteModeNone,
+			expectSendNativeHistograms: false,
+		},
+		{
+			name: "explicit none mode with v1",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: prometheus.WriteRequest
+    mode: none
+`,
+			expectMode:                 remoteapi.WriteModeNone,
+			expectSendNativeHistograms: false,
+		},
+		{
+			name: "stateless mode defaults send_native_histograms to true",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless
+`,
+			expectMode:                 remoteapi.WriteModeStateless,
+			expectSendNativeHistograms: true,
+		},
+		{
+			name: "stateless-st mode defaults send_native_histograms to true",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless-st
+`,
+			expectMode:                 remoteapi.WriteModeStatelessST,
+			expectSendNativeHistograms: true,
+		},
+		{
+			name: "stateless mode with explicit send_native_histograms=true",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless
+    send_native_histograms: true
+`,
+			expectMode:                 remoteapi.WriteModeStateless,
+			expectSendNativeHistograms: true,
+		},
+		{
+			name: "stateless mode with explicit send_native_histograms=false fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless
+    send_native_histograms: false
+`,
+			errString: `send_native_histograms cannot be false when remote_write mode is "stateless"`,
+		},
+		{
+			name: "stateless-st mode with explicit send_native_histograms=false fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless-st
+    send_native_histograms: false
+`,
+			errString: `send_native_histograms cannot be false when remote_write mode is "stateless-st"`,
+		},
+		{
+			name: "stateless mode with convert_nhcb_to_classic=true fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: stateless
+    convert_nhcb_to_classic: true
+`,
+			errString: `convert_nhcb_to_classic cannot be enabled when remote_write mode is "stateless"`,
+		},
+		{
+			name: "stateless mode with v1 protobuf_message fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: prometheus.WriteRequest
+    mode: stateless
+`,
+			errString: `mode "stateless" is only supported with protobuf message "io.prometheus.write.v2.Request", got "prometheus.WriteRequest"`,
+		},
+		{
+			name: "stateless mode with default (v1) protobuf_message fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    mode: stateless
+`,
+			errString: `mode "stateless" is only supported with protobuf message "io.prometheus.write.v2.Request", got "prometheus.WriteRequest"`,
+		},
+		{
+			name: "stateless-st mode with v1 protobuf_message fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: prometheus.WriteRequest
+    mode: stateless-st
+`,
+			errString: `mode "stateless-st" is only supported with protobuf message "io.prometheus.write.v2.Request", got "prometheus.WriteRequest"`,
+		},
+		{
+			name: "stateless-st mode with default (v1) protobuf_message fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    mode: stateless-st
+`,
+			errString: `mode "stateless-st" is only supported with protobuf message "io.prometheus.write.v2.Request", got "prometheus.WriteRequest"`,
+		},
+		{
+			name: "unknown mode fails",
+			config: `
+remote_write:
+  - url: http://localhost:9090/api/v1/write
+    protobuf_message: io.prometheus.write.v2.Request
+    mode: invalid
+`,
+			errString: `unknown remote write mode "invalid", supported: none, stateless, stateless-st`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load(tc.config, promslog.NewNopLogger())
+			if tc.errString != "" {
+				require.ErrorContains(t, err, tc.errString)
+				return
+			}
+			require.NoError(t, err)
+			require.Len(t, cfg.RemoteWriteConfigs, 1)
+			require.Equal(t, tc.expectMode, cfg.RemoteWriteConfigs[0].Mode)
+			require.Equal(t, tc.expectSendNativeHistograms, cfg.RemoteWriteConfigs[0].SendNativeHistograms)
+		})
+	}
 }

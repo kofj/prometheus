@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -13,7 +13,12 @@
 
 package testutil
 
-import "time"
+import (
+	"context"
+	"time"
+
+	"go.uber.org/atomic"
+)
 
 // A MockContext provides a simple stub implementation of a Context.
 type MockContext struct {
@@ -22,7 +27,7 @@ type MockContext struct {
 }
 
 // Deadline always will return not set.
-func (c *MockContext) Deadline() (deadline time.Time, ok bool) {
+func (*MockContext) Deadline() (deadline time.Time, ok bool) {
 	return time.Time{}, false
 }
 
@@ -37,6 +42,26 @@ func (c *MockContext) Err() error {
 }
 
 // Value ignores the Value and always returns nil.
-func (c *MockContext) Value(interface{}) interface{} {
+func (*MockContext) Value(any) any {
 	return nil
+}
+
+// MockContextErrAfter is a MockContext that will return an error after a certain
+// number of calls to Err().
+type MockContextErrAfter struct {
+	count atomic.Uint64
+	MockContext
+	FailAfter uint64
+}
+
+func (c *MockContextErrAfter) Err() error {
+	c.count.Inc()
+	if c.count.Load() >= c.FailAfter {
+		return context.Canceled
+	}
+	return c.MockContext.Err()
+}
+
+func (c *MockContextErrAfter) Count() uint64 {
+	return c.count.Load()
 }

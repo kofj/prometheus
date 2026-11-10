@@ -1,4 +1,4 @@
-// Copyright 2019 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,11 +15,12 @@ package refresh
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -56,7 +57,7 @@ func TestRefresh(t *testing.T) {
 	}
 
 	var i int
-	refresh := func(ctx context.Context) ([]*targetgroup.Group, error) {
+	refresh := func(context.Context) ([]*targetgroup.Group, error) {
 		i++
 		switch i {
 		case 1:
@@ -64,7 +65,7 @@ func TestRefresh(t *testing.T) {
 		case 2:
 			return tg2, nil
 		}
-		return nil, fmt.Errorf("some error")
+		return nil, errors.New("some error")
 	}
 	interval := time.Millisecond
 
@@ -76,6 +77,7 @@ func TestRefresh(t *testing.T) {
 		Options{
 			Logger:              nil,
 			Mech:                "test",
+			SetName:             "test-refresh",
 			Interval:            interval,
 			RefreshF:            refresh,
 			MetricsInstantiator: metrics,
@@ -83,8 +85,7 @@ func TestRefresh(t *testing.T) {
 	)
 
 	ch := make(chan []*targetgroup.Group)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go d.Run(ctx, ch)
 
 	tg := <-ch
@@ -100,4 +101,28 @@ func TestRefresh(t *testing.T) {
 		require.FailNow(t, "Unexpected target group")
 	case <-tick.C:
 	}
+}
+
+func TestRefreshUpdateSetName(t *testing.T) {
+	metrics := discovery.NewRefreshMetrics(prometheus.NewRegistry())
+	require.NoError(t, metrics.Register())
+	defer metrics.Unregister()
+
+	d := NewDiscovery(
+		Options{
+			Mech:     "test",
+			SetName:  "old",
+			Interval: time.Hour,
+			RefreshF: func(context.Context) ([]*targetgroup.Group, error) {
+				return nil, errors.New("some error")
+			},
+			MetricsInstantiator: metrics,
+		},
+	)
+	d.UpdateSetName("new")
+
+	_, err := d.refresh(t.Context())
+	require.Error(t, err)
+	require.Equal(t, 0.0, testutil.ToFloat64(metrics.Instantiate("test", "old").Failures))
+	require.Equal(t, 1.0, testutil.ToFloat64(metrics.Instantiate("test", "new").Failures))
 }

@@ -1,4 +1,4 @@
-// Copyright 2022 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -54,7 +54,7 @@ func (e *AggregateExpr) Pretty(level int) string {
 		return s
 	}
 
-	s += e.getAggOpStr()
+	s += e.ShortString()
 	s += "(\n"
 
 	if e.Op.IsAggregatorWithParam() {
@@ -76,7 +76,26 @@ func (e *BinaryExpr) Pretty(level int) string {
 	}
 
 	matching := e.getMatchingStr()
-	return fmt.Sprintf("%s\n%s%s%s%s\n%s", e.LHS.Pretty(level+1), indent(level), e.Op, returnBool, matching, e.RHS.Pretty(level+1))
+	return fmt.Sprintf("%s\n%s%s%s%s\n%s", e.lhs().Pretty(level+1), indent(level), e.Op, returnBool, matching, e.RHS.Pretty(level+1))
+}
+
+func (e *DurationExpr) Pretty(int) string {
+	var s string
+	if e.LHS == nil {
+		// Unary plus is not printed, matching String(), so a parenthesised
+		// number lifted into a unary-plus DurationExpr round-trips as (5).
+		if e.Op == ADD && e.RHS != nil {
+			s = e.RHS.Pretty(0)
+		} else {
+			s = fmt.Sprintf("%s%s", e.Op, e.RHS.Pretty(0))
+		}
+	} else {
+		s = fmt.Sprintf("%s %s %s", e.LHS.Pretty(0), e.Op, e.RHS.Pretty(0))
+	}
+	if e.Wrapped {
+		s = fmt.Sprintf("(%s)", s)
+	}
+	return s
 }
 
 func (e *Call) Pretty(level int) string {
@@ -89,17 +108,22 @@ func (e *Call) Pretty(level int) string {
 	return s
 }
 
-func (e *EvalStmt) Pretty(_ int) string {
+func (e *EvalStmt) Pretty(int) string {
 	return "EVAL " + e.Expr.String()
 }
 
 func (e Expressions) Pretty(level int) string {
 	// Do not prefix the indent since respective nodes will indent itself.
-	s := ""
-	for i := range e {
-		s += fmt.Sprintf("%s,\n", e[i].Pretty(level))
+	if len(e) == 0 {
+		return ""
 	}
-	return s[:len(s)-2]
+
+	parts := make([]string, len(e))
+	for i := range e {
+		parts[i] = e[i].Pretty(level)
+	}
+
+	return strings.Join(parts, ",\n")
 }
 
 func (e *ParenExpr) Pretty(level int) string {

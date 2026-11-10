@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,7 +15,16 @@
 
 package chunks
 
+import "os"
+
 // HeadChunkFilePreallocationSize is the size to which the m-map file should be preallocated when a new file is cut.
 // Windows needs pre-allocations while the other OS does not. But we observed that a 0 pre-allocation causes unit tests to flake.
 // This small allocation for non-Windows OSes removes the flake.
 var HeadChunkFilePreallocationSize int64 = MinWriteBufferSize * 2
+
+// removeChunkFile deletes a head chunk file. The Windows build has a retry
+// wrapper around os.Remove to tolerate transient sharing violations caused by
+// antivirus and indexing services; non-Windows platforms need no such retry.
+func removeChunkFile(path string) error {
+	return os.Remove(path)
+}

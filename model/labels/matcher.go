@@ -1,4 +1,4 @@
-// Copyright 2017 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -14,7 +14,8 @@
 package labels
 
 import (
-	"fmt"
+	"bytes"
+	"strconv"
 )
 
 // MatchType is an enum for label matching types.
@@ -78,7 +79,29 @@ func MustNewMatcher(mt MatchType, name, val string) *Matcher {
 }
 
 func (m *Matcher) String() string {
-	return fmt.Sprintf("%s%s%q", m.Name, m.Type, m.Value)
+	// Start a buffer with a pre-allocated size on stack to cover most needs.
+	var bytea [1024]byte
+	b := bytes.NewBuffer(bytea[:0])
+
+	if m.shouldQuoteName() {
+		b.Write(strconv.AppendQuote(b.AvailableBuffer(), m.Name))
+	} else {
+		b.WriteString(m.Name)
+	}
+	b.WriteString(m.Type.String())
+	b.Write(strconv.AppendQuote(b.AvailableBuffer(), m.Value))
+
+	return b.String()
+}
+
+func (m *Matcher) shouldQuoteName() bool {
+	for i, c := range m.Name {
+		if c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (i > 0 && c >= '0' && c <= '9') {
+			continue
+		}
+		return true
+	}
+	return m.Name == ""
 }
 
 // Matches returns whether the matcher matches the given string value.
@@ -129,10 +152,10 @@ func (m *Matcher) SetMatches() []string {
 	return m.re.SetMatches()
 }
 
-// Prefix returns the required prefix of the value to match, if possible.
+// Prefix returns the required prefix of the value to match byte-for-byte, if possible.
 // It will be empty if it's an equality matcher or if the prefix can't be determined.
 func (m *Matcher) Prefix() string {
-	if m.re == nil {
+	if m.re == nil || m.re.caseInsensitivePrefix {
 		return ""
 	}
 	return m.re.prefix

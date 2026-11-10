@@ -1,10 +1,8 @@
 ---
-title: Querying examples
+title: Query examples
 nav_title: Examples
 sort_rank: 4
 ---
-
-# Query examples
 
 ## Simple time series selection
 
@@ -25,13 +23,10 @@ for the same vector, making it a [range vector](../basics/#range-vector-selector
 Note that an expression resulting in a range vector cannot be graphed directly,
 but viewed in the tabular ("Console") view of the expression browser.
 
-Using regular expressions, you could select time series only for jobs whose
+Using [regular expressions](./basics.md#regular-expressions), you could select time series only for jobs whose
 name match a certain pattern, in this case, all jobs that end with `server`:
 
     http_requests_total{job=~".*server"}
-
-All regular expressions in Prometheus use [RE2
-syntax](https://github.com/google/re2/wiki/Syntax).
 
 To select all HTTP status codes except 4xx ones, you could run:
 
@@ -95,3 +90,44 @@ Assuming this metric contains one time series per running instance, you could
 count the number of running instances per application like this:
 
     count by (app) (instance_cpu_time_ns)
+
+If we are exploring some metrics for their labels, to e.g. be able to aggregate
+over some of them, we could use the following:
+
+    limitk(10, app_foo_metric_bar)
+
+Alternatively, if we wanted the returned timeseries to be more evenly sampled,
+we could use the following to get approximately 10% of them:
+
+    limit_ratio(0.1, app_foo_metric_bar)
+
+Calculate the total cost over past week given the per-node hourly cost
+(`integral()` requires `--enable-feature=promql-experimental-functions`):
+
+    integral(hourly_cost[7d]) / 3600
+
+Ditto above, but use left-point sampling for the integral, for example if
+instant corresponds to the start of the interval (use `1` for right-point):
+
+    integral(hourly_cost[7d], 0) / 3600
+
+Calculate the total energy consumed in kWh over last day, given the instant
+power consumption in Watts:
+
+    integral(power_rate[1d]) / 1000 / 3600
+
+For those "boolean" metrics that produce `1`s or `0`s, integrating them over
+time will give the _time in seconds_ that the value was `1`, for example, to
+get the _amount of time_ a particular metric has been absent during the past
+day (sampled every 5 minutes):
+
+    integral((absent(metric_name) or vector(0))[1d:5m])
+
+The `or vector(0)` supplies zero when the metric is present, so the integral
+does not connect separate periods of absence across healthy periods.
+
+As another case for measuring _amount of time_, for example a boolean metric
+representing a service level agreement (SLA) being met divided by the total
+time, will give the SLA ratio:
+
+    integral(service_sla_ok[7d]) / (3600 * 24 * 7)

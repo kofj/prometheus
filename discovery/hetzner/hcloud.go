@@ -1,4 +1,4 @@
-// Copyright 2020 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -15,13 +15,12 @@ package hetzner
 
 import (
 	"context"
-	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"time"
 
-	"github.com/go-kit/log"
 	"github.com/hetznercloud/hcloud-go/v2/hcloud"
 	"github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
@@ -39,8 +38,10 @@ const (
 	hetznerLabelHcloudImageOSVersion                = hetznerHcloudLabelPrefix + "image_os_version"
 	hetznerLabelHcloudImageOSFlavor                 = hetznerHcloudLabelPrefix + "image_os_flavor"
 	hetznerLabelHcloudPrivateIPv4                   = hetznerHcloudLabelPrefix + "private_ipv4_"
-	hetznerLabelHcloudDatacenterLocation            = hetznerHcloudLabelPrefix + "datacenter_location"
-	hetznerLabelHcloudDatacenterLocationNetworkZone = hetznerHcloudLabelPrefix + "datacenter_location_network_zone"
+	hetznerLabelHcloudLocation                      = hetznerHcloudLabelPrefix + "location"
+	hetznerLabelHcloudLocationNetworkZone           = hetznerHcloudLabelPrefix + "location_network_zone"
+	hetznerLabelHcloudDatacenterLocation            = hetznerHcloudLabelPrefix + "datacenter_location"              // Label name kept for backward compatibility
+	hetznerLabelHcloudDatacenterLocationNetworkZone = hetznerHcloudLabelPrefix + "datacenter_location_network_zone" // Label name kept for backward compatibility
 	hetznerLabelHcloudCPUCores                      = hetznerHcloudLabelPrefix + "cpu_cores"
 	hetznerLabelHcloudCPUType                       = hetznerHcloudLabelPrefix + "cpu_type"
 	hetznerLabelHcloudMemoryGB                      = hetznerHcloudLabelPrefix + "memory_size_gb"
@@ -54,14 +55,16 @@ const (
 // the Discoverer interface.
 type hcloudDiscovery struct {
 	*refresh.Discovery
-	client *hcloud.Client
-	port   int
+	client        *hcloud.Client
+	port          int
+	labelSelector string
 }
 
 // newHcloudDiscovery returns a new hcloudDiscovery which periodically refreshes its targets.
-func newHcloudDiscovery(conf *SDConfig, _ log.Logger) (*hcloudDiscovery, error) {
+func newHcloudDiscovery(conf *SDConfig, _ *slog.Logger) (*hcloudDiscovery, error) {
 	d := &hcloudDiscovery{
-		port: conf.Port,
+		port:          conf.Port,
+		labelSelector: conf.LabelSelector,
 	}
 
 	rt, err := config.NewRoundTripperFromConfig(conf.HTTPClientConfig, "hetzner_sd")
@@ -80,7 +83,10 @@ func newHcloudDiscovery(conf *SDConfig, _ log.Logger) (*hcloudDiscovery, error) 
 }
 
 func (d *hcloudDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
-	servers, err := d.client.Server.All(ctx)
+	servers, err := d.client.Server.AllWithOpts(ctx, hcloud.ServerListOpts{ListOpts: hcloud.ListOpts{
+		PerPage:       50,
+		LabelSelector: d.labelSelector,
+	}})
 	if err != nil {
 		return nil, err
 	}
@@ -92,20 +98,21 @@ func (d *hcloudDiscovery) refresh(ctx context.Context) ([]*targetgroup.Group, er
 	for i, server := range servers {
 		labels := model.LabelSet{
 			hetznerLabelRole:              model.LabelValue(HetznerRoleHcloud),
-			hetznerLabelServerID:          model.LabelValue(fmt.Sprintf("%d", server.ID)),
+			hetznerLabelServerID:          model.LabelValue(strconv.FormatInt(server.ID, 10)),
 			hetznerLabelServerName:        model.LabelValue(server.Name),
-			hetznerLabelDatacenter:        model.LabelValue(server.Datacenter.Name),
 			hetznerLabelPublicIPv4:        model.LabelValue(server.PublicNet.IPv4.IP.String()),
 			hetznerLabelPublicIPv6Network: model.LabelValue(server.PublicNet.IPv6.Network.String()),
 			hetznerLabelServerStatus:      model.LabelValue(server.Status),
 
-			hetznerLabelHcloudDatacenterLocation:            model.LabelValue(server.Datacenter.Location.Name),
-			hetznerLabelHcloudDatacenterLocationNetworkZone: model.LabelValue(server.Datacenter.Location.NetworkZone),
+			hetznerLabelHcloudLocation:                      model.LabelValue(server.Location.Name),
+			hetznerLabelHcloudLocationNetworkZone:           model.LabelValue(server.Location.NetworkZone),
+			hetznerLabelHcloudDatacenterLocation:            model.LabelValue(server.Location.Name),        // Label name kept for backward compatibility
+			hetznerLabelHcloudDatacenterLocationNetworkZone: model.LabelValue(server.Location.NetworkZone), // Label name kept for backward compatibility
 			hetznerLabelHcloudType:                          model.LabelValue(server.ServerType.Name),
-			hetznerLabelHcloudCPUCores:                      model.LabelValue(fmt.Sprintf("%d", server.ServerType.Cores)),
+			hetznerLabelHcloudCPUCores:                      model.LabelValue(strconv.Itoa(server.ServerType.Cores)),
 			hetznerLabelHcloudCPUType:                       model.LabelValue(server.ServerType.CPUType),
-			hetznerLabelHcloudMemoryGB:                      model.LabelValue(fmt.Sprintf("%d", int(server.ServerType.Memory))),
-			hetznerLabelHcloudDiskGB:                        model.LabelValue(fmt.Sprintf("%d", server.ServerType.Disk)),
+			hetznerLabelHcloudMemoryGB:                      model.LabelValue(strconv.Itoa(int(server.ServerType.Memory))),
+			hetznerLabelHcloudDiskGB:                        model.LabelValue(strconv.Itoa(server.ServerType.Disk)),
 
 			model.AddressLabel: model.LabelValue(net.JoinHostPort(server.PublicNet.IPv4.IP.String(), strconv.FormatUint(uint64(d.port), 10))),
 		}
